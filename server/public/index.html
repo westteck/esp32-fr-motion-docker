@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ESP32-CAM Dashboard</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #111; color: #eee; font-family: system-ui, sans-serif; }
+    header { padding: 16px 24px; background: #1a1a1a; border-bottom: 1px solid #333; display: flex; justify-content: space-between; align-items: center; }
+    h1 { font-size: 1.2rem; font-weight: 600; }
+    #status { font-size: 0.8rem; color: #888; }
+    #grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(480px, 1fr)); gap: 12px; padding: 12px; }
+    .cam-card { background: #1a1a1a; border-radius: 8px; overflow: hidden; border: 1px solid #333; position: relative; }
+    .cam-card.motion { border-color: #f44; box-shadow: 0 0 12px rgba(255,68,68,0.3); }
+    .cam-header { padding: 8px 12px; display: flex; justify-content: space-between; align-items: center; background: #222; }
+    .cam-name { font-weight: 600; font-size: 0.9rem; }
+    .cam-age { font-size: 0.75rem; color: #888; }
+    .cam-age.stale { color: #f44; }
+    .motion-badge { display: none; font-size: 0.7rem; background: #f44; color: #fff; padding: 2px 8px; border-radius: 4px; margin-left: 8px; }
+    .motion-badge.active { display: inline; }
+    .cam-img { width: 100%; aspect-ratio: 4/3; object-fit: cover; display: block; background: #000; }
+    .empty { padding: 40px; text-align: center; color: #555; font-size: 0.9rem; }
+    .events-panel { padding: 12px; background: #1a1a1a; border-top: 1px solid #333; }
+    .events-title { font-size: 0.8rem; color: #888; margin-bottom: 8px; }
+    .event-thumbs { display: flex; gap: 4px; overflow-x: auto; padding-bottom: 4px; }
+    .event-thumb { width: 60px; height: 45px; object-fit: cover; border-radius: 3px; cursor: pointer; border: 1px solid #333; flex-shrink: 0; }
+    .event-thumb:hover { border-color: #f44; }
+    .event-time { font-size: 0.6rem; color: #666; text-align: center; }
+    .event-item { display: flex; flex-direction: column; align-items: center; gap: 2px; flex-shrink: 0; }
+    .modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.9); z-index: 100; justify-content: center; align-items: center; }
+    .modal.active { display: flex; }
+    .modal img { max-width: 90vw; max-height: 90vh; }
+    .modal-close { position: absolute; top: 20px; right: 30px; color: #fff; font-size: 2rem; cursor: pointer; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>ESP32-CAM Dashboard</h1>
+    <span id="status">polling...</span>
+  </header>
+  <div id="grid"></div>
+  <div class="modal" id="modal" onclick="this.classList.remove('active')">
+    <span class="modal-close">&times;</span>
+    <img id="modal-img" src="">
+  </div>
+
+  <script>
+    const grid = document.getElementById('grid')
+    const statusEl = document.getElementById('status')
+    const cameras = new Map()
+    const motionState = new Map()
+
+    function formatTime(ts) {
+      const d = new Date(ts * 1000)
+      return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+    }
+
+    async function loadEvents(camId) {
+      try {
+        const res = await fetch(`/events.php?camId=${camId}`)
+        const events = await res.json()
+        const panel = document.getElementById(`events-${camId}`)
+        if (!panel || !events.length) return
+        const recent = events.slice(-20).reverse()
+        panel.innerHTML = recent.map(e =>
+          `<div class="event-item">
+            <img class="event-thumb" src="/frame.php?camId=${camId}&event=${e.file}" onclick="showFull('${camId}','${e.file}')">
+            <span class="event-time">${formatTime(e.ts)}</span>
+          </div>`
+        ).join('')
+      } catch {}
+    }
+
+    function showFull(camId, file) {
+      document.getElementById('modal-img').src = `/frame.php?camId=${camId}&event=${file}`
+      document.getElementById('modal').classList.add('active')
+    }
+
+    function render() {
+      if (cameras.size === 0) {
+        grid.innerHTML = '<div class="empty">No cameras connected yet. Send images to /upload.php?camId=YOUR_CAM_ID</div>'
+        return
+      }
+      grid.innerHTML = ''
+      for (const [id, ts] of cameras) {
+        const motion = motionState.get(id) || false
+        const card = document.createElement('div')
+        card.className = `cam-card${motion ? ' motion' : ''}`
+        card.innerHTML = `
+          <div class="cam-header">
+            <div>
+              <span class="cam-name">${id}</span>
+              <span class="motion-badge${motion ? ' active' : ''}" id="badge-${id}">MOTION</span>
+            </div>
+            <span class="cam-age" id="age-${id}">just now</span>
+          </div>
+          <img class="cam-img" src="/frame.php?camId=${id}&t=${ts}" alt="${id}" id="img-${id}">
+          <div class="events-panel">
+            <div class="events-title">Motion events</div>
+            <div class="event-thumbs" id="events-${id}">loading...</div>
+          </div>
+        `
+        grid.appendChild(card)
+        loadEvents(id)
+      }
+    }
+
+    function updateAges() {
+      const now = Date.now()
+      for (const [id, ts] of cameras) {
+        const ageEl = document.getElementById(`age-${id}`)
+        if (!ageEl) continue
+        const sec = Math.round((now - ts) / 1000)
+        ageEl.textContent = sec < 2 ? 'just now' : `${sec}s ago`
+        ageEl.className = `cam-age${sec > 10 ? ' stale' : ''}`
+      }
+    }
+
+    async function poll() {
+      try {
+        const res = await fetch('/cameras.php')
+        const list = await res.json()
+        let changed = false
+        const seen = new Set()
+
+        for (const c of list) {
+          seen.add(c.id)
+          const old = cameras.get(c.id)
+          if (!old || old !== c.lastFrame) {
+            changed = true
+            cameras.set(c.id, c.lastFrame)
+            const img = document.getElementById(`img-${c.id}`)
+            if (img) img.src = `/frame.php?camId=${c.id}&t=${c.lastFrame}`
+          }
+          if (c.motion !== undefined) {
+            const was = motionState.get(c.id)
+            if (was !== c.motion) {
+              motionState.set(c.id, c.motion)
+              changed = true
+            }
+          }
+        }
+
+        for (const id of cameras.keys()) {
+          if (!seen.has(id)) { cameras.delete(id); changed = true }
+        }
+
+        if (changed) render()
+        statusEl.textContent = 'live'
+      } catch {
+        statusEl.textContent = 'poll failed'
+      }
+    }
+
+    poll().then(() => {
+      render()
+      setInterval(poll, 1000)
+      setInterval(updateAges, 1000)
+    })
+  </script>
+</body>
+</html>
