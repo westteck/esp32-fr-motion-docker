@@ -1,0 +1,35 @@
+version: '3.8'
+services:
+  web:
+    image: php:8.3-fpm-alpine
+    container_name: esp32-php
+    volumes:
+      - /home/raggsy/esp32-cam-server/www:/var/www/html
+      - /home/raggsy/esp32-cam-server/uploads:/var/www/uploads
+    restart: always
+
+  nginx:
+    image: nginx:alpine
+    container_name: esp32-nginx
+    ports:
+      - "8787:80"
+    volumes:
+      - /home/raggsy/esp32-cam-server/www:/var/www/html
+      - /home/raggsy/esp32-cam-server/uploads:/var/www/uploads
+      - /home/raggsy/esp32-cam-server/nginx-conf:/etc/nginx/conf.d:ro
+    depends_on:
+      - web
+    restart: always
+
+  brain:
+    image: python:3.11-slim
+    container_name: esp32-brain
+    volumes:
+      - /home/raggsy/esp32-cam-server/uploads:/app/uploads
+      - /home/raggsy/esp32-cam-server/known_faces:/app/known_faces
+      - /home/raggsy/esp32-cam-server/rclone-config:/root/.config/rclone
+      - ./brain_script.py:/app/brain_script.py
+    working_dir: /app
+    # Updated startup to pull latest rclone binary directly instead of using old apt package
+    command: sh -c "apt-get update && apt-get install -y curl unzip && curl -L https://rclone.org/install.sh | bash && pip install opencv-python-headless face-recognition && python3 brain_script.py"
+    restart: always

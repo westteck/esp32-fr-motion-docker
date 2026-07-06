@@ -1,33 +1,42 @@
 /*
-  ESP32-CAM → Remote Server Uploader v2
-  Software motion detection via JPEG size differencing.
-  Dual rate: idle 1fps (checking), active 5fps (recording).
-
-  Board: 0=AI Thinker, 1=Freenove WROVER-DEV
-  Per-device: change CAM_ID to cam1/cam2/cam3.
+  ESP32-CAM Multi-Function System v4
+  - Live MJPEG Streaming
+  - Command Polling (Record/Reboot/Settings)
+  - Dual-rate Motion Uploads
+  - STATIC IP Configuration
+  - Targeted for Local Server 10.10.10.110:8787
 */
 
 #include "esp_camera.h"
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include <WebServer.h>
 
 // ── CONFIG ──────────────────────────────────────────
 #define BOARD_TYPE 0
 
-struct WifiNet { const char* ssid; const char* pass; };
-const WifiNet WIFI_NETS[] = {
-  {"ludo",          "Vanillalotus849"},
-  {"ATT8Fdp4tz",    "5u3kzu?g9=93"},
-};
-const int WIFI_NET_COUNT = sizeof(WIFI_NETS) / sizeof(WIFI_NETS[0]);
+// WiFi & Static IP Configuration
+const char* ssid       = "ludo5";
+const char* pass       = "Vanillalotus849";
 
-const char* SERVER_URL    = "http://raggsy.com/cam/upload.php";
+IPAddress local_IP     = IPAddress(10, 10, 10, 2);
+IPAddress gateway      = IPAddress(10, 10, 10, 1);
+IPAddress subnet       = IPAddress(255, 255, 255, 0);
+IPAddress primaryDNS   = IPAddress(10, 10, 10, 10);
+IPAddress secondaryDNS = IPAddress(0, 0, 0, 0); // No secondary DNS
+
+const char* SERVER_IP     = "10.10.10.110";
+const int   SERVER_PORT   = 8787;
 const char* CAM_ID        = "cam1";
 
-const int IDLE_INTERVAL_MS    = 1000;   // motion check rate
-const int ACTIVE_INTERVAL_MS  = 200;    // recording rate (~5 FPS)
-const int COOLDOWN_MS         = 5000;   // keep recording after motion stops
-const int MOTION_THRESHOLD_PCT = 12;    // JPEG size change % to trigger
+const int IDLE_INTERVAL_MS    = 1000;  
+const int ACTIVE_INTERVAL_MS   = 200;   
+const int COOLDOWN_MS          = 5000;  
+const int MOTION_THRESHOLD_PCT = 12;   
+
+// Polling Intervals
+const int CMD_POLL_INTERVAL    = 2000; 
+const int SETTINGS_POLL_INTERVAL = 10000; 
 // ────────────────────────────────────────────────────
 
 #if BOARD_TYPE == 0
@@ -66,17 +75,72 @@ const int MOTION_THRESHOLD_PCT = 12;    // JPEG size change % to trigger
   #define HREF_GPIO_NUM    23
   #define PCLK_GPIO_NUM    22
   #define LED_FLASH        -1
-#else
-  #error "Invalid BOARD_TYPE"
 #endif
 
 bool motionActive = false;
 unsigned long lastMotionTime = 0;
 size_t lastJpegSize = 0;
+WebServer server(80); 
+
+void handleStream() {
+  WiFiClient client = server.client();
+  client.print("HTTP/1.1 200 OK\\r\\n");
+  client.print("Content-Type: multipart/x-mixed-replace; boundary=frame\\r\\n\\r\\n");
+  
+  while (client.connected()) {
+    camera_fb_t * fb = esp_camera_fb_get();
+    if (!fb) continue;
+    
+    client.print("--frame\\r\\n");
+    client.print("Content-Type: image/jpeg\\r\\n");
+    client.print("Content-Length: " + String(fb->len) + "\\r\\n\\r\\n");
+    client.write(fb->buf, fb->len);
+    client.print("\\r\\n");
+    
+    esp_camera_fb_return(fb);
+    delay(100); 
+  }
+}
+
+void checkCommands() {
+  HTTPClient http;
+  String url = "http://" + String(SERVER_IP) + ":" + String(SERVER_PORT) + "/uploads/commands.json";
+  http.begin(url);
+  int code = http.GET();
+  
+  if (code == 200) {
+    String payload = http.getString();
+    if (payload.indexOf("RECORD_VIDEO") != -1) {
+      Serial.println("[CMD] Video Recording Triggered!");
+      // Recording logic can be added here
+    } else if (payload.indexOf("REBOOT") != -1) {
+      Serial.println("[CMD] Rebooting...");
+      delay(500);
+      ESP.restart();
+    }
+  }
+  http.end();
+}
+
+void syncSettings() {
+  HTTPClient http;
+  String url = "http://" + String(SERVER_IP) + ":" + String(SERVER_PORT) + "/uploads/settings.json";
+  http.begin(url);
+  if (http.GET() == 200) {
+    String payload = http.getString();
+    sensor_t* s = esp_camera_sensor_get();
+    // Logic to parse settings.json and apply s->set_brightness etc.
+  }
+  http.end();
+}
 
 void setup() {
   Serial.begin(115200);
-  Serial.println("\nESP32-CAM v2 starting...");
+  
+  // Configure Static IP
+  if (!WiFi.config(local_IP, gateway, subnet, primaryDNS, secondaryDNS)) {
+    Serial.println("STA Failed to configure Static IP");
+  }
 
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
@@ -103,101 +167,77 @@ void setup() {
   config.jpeg_quality = 12;
   config.fb_count     = 2;
 
-  esp_err_t err = esp_camera_init(&config);
-  if (err != ESP_OK) {
-    Serial.printf("Camera init failed: 0x%x\n", err);
-    return;
-  }
+  if (esp_camera_init(&config) != ESP_OK) return;
 
   sensor_t* s = esp_camera_sensor_get();
   s->set_vflip(s, 1);
-  s->set_brightness(s, 1);
-  s->set_contrast(s, 0);
 
-  for (int i = 0; i < WIFI_NET_COUNT; i++) {
-    Serial.printf("Trying WiFi: %s\n", WIFI_NETS[i].ssid);
-    WiFi.begin(WIFI_NETS[i].ssid, WIFI_NETS[i].pass);
-    unsigned long start = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
-      delay(500);
-      Serial.print(".");
-    }
-    if (WiFi.status() == WL_CONNECTED) {
-      Serial.printf("\nWiFi connected. IP: %s\n", WiFi.localIP().toString().c_str());
-      break;
-    }
-    Serial.println(" failed");
+  Serial.printf("Connecting to %s...", ssid);
+  WiFi.begin(ssid, pass);
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
+    delay(500);
+    Serial.print(".");
   }
-
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("All networks failed. Restarting in 10s...");
-    delay(10000);
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("\\nWiFi connected. IP: %s\\n", WiFi.localIP().toString().c_str());
+  } else {
+    Serial.println("\\nWiFi failed. Restarting...");
+    delay(5000);
     ESP.restart();
   }
-}
-
-bool detectMotion(size_t currentSize) {
-  if (lastJpegSize == 0) {
-    lastJpegSize = currentSize;
-    return false;
-  }
-  size_t diff = currentSize > lastJpegSize
-    ? currentSize - lastJpegSize
-    : lastJpegSize - currentSize;
-  float pct = (float)diff / (float)lastJpegSize * 100.0;
-  lastJpegSize = currentSize;
-  return pct > MOTION_THRESHOLD_PCT;
+  
+  server.on("/stream", handleStream);
+  server.begin();
 }
 
 bool uploadFrame(camera_fb_t* fb, bool motion) {
   HTTPClient http;
-  String url = String(SERVER_URL) + "?camId=" + CAM_ID;
+  String url = "http://" + String(SERVER_IP) + ":" + String(SERVER_PORT) + "/upload.php?camId=" + CAM_ID;
   if (motion) url += "&motion=1";
   http.begin(url);
   http.addHeader("Content-Type", "image/jpeg");
-  http.setTimeout(5000);
-
   int code = http.POST((uint8_t*)fb->buf, fb->len);
   http.end();
-
-  if (code == 200) {
-    Serial.println(motion ? "Upload [MOTION]" : "Upload OK");
-    return true;
-  }
-  Serial.printf("Upload failed: %d\n", code);
-  return false;
+  return (code == 200);
 }
 
 void loop() {
+  server.handleClient(); 
+  
   unsigned long now = millis();
   static unsigned long lastCapture = 0;
+  static unsigned long lastCmdPoll = 0;
+  static unsigned long lastSettingsSync = 0;
 
   int interval = motionActive ? ACTIVE_INTERVAL_MS : IDLE_INTERVAL_MS;
-
-  if (now - lastCapture < interval) {
-    delay(10);
-    return;
+  if (now - lastCapture >= interval) {
+    camera_fb_t* fb = esp_camera_fb_get();
+    if (fb) {
+      bool motion = (abs((int)fb->len - (int)lastJpegSize) > (lastJpegSize * MOTION_THRESHOLD_PCT / 100));
+      lastJpegSize = fb->len;
+      
+      if (motion) {
+        motionActive = true;
+        lastMotionTime = now;
+      } else if (motionActive && now - lastMotionTime > COOLDOWN_MS) {
+        motionActive = false;
+      }
+      
+      uploadFrame(fb, motion);
+      esp_camera_fb_return(fb);
+    }
+    lastCapture = now;
   }
 
-  camera_fb_t* fb = esp_camera_fb_get();
-  if (!fb) {
-    Serial.println("Capture failed");
-    delay(100);
-    return;
+  if (now - lastCmdPoll >= CMD_POLL_INTERVAL) {
+     checkCommands();
+     lastCmdPoll = now;
   }
 
-  lastCapture = now;
-  bool motion = detectMotion(fb->len);
-
-  if (motion) {
-    if (!motionActive) Serial.println("Motion START");
-    motionActive = true;
-    lastMotionTime = now;
-  } else if (motionActive && now - lastMotionTime > COOLDOWN_MS) {
-    Serial.println("Motion STOP");
-    motionActive = false;
+  if (now - lastSettingsSync >= SETTINGS_POLL_INTERVAL) {
+     syncSettings();
+     lastSettingsSync = now;
   }
-
-  uploadFrame(fb, motion);
-  esp_camera_fb_return(fb);
 }

@@ -1,0 +1,20 @@
+# System Local Data
+uploads/
+known_faces/
+rclone-config/
+
+# Credentials & Secrets
+*.conf
+.env
+proton-drive-rclone-setup.md
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.pyc
+.venv/

@@ -1,0 +1,359 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ESP32-CAM | Management Console</title>
+    <style>
+        :root {
+            --bg: #0f172a;
+            --panel: #1e293b;
+            --accent: #3b82f6;
+            --danger: #ef4444;
+            --text: #f8fafc;
+            --text-dim: #94a3b8;
+        }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: var(--bg);
+            color: var(--text);
+            margin: 0;
+            display: flex;
+            height: 100vh;
+            overflow: hidden;
+        }
+        nav {
+            width: 240px;
+            background-color: var(--panel);
+            display: flex;
+            flex-direction: column;
+            padding: 20px;
+            border-right: 1px solid #334155;
+            gap: 10px;
+        }
+        nav h1 {
+            font-size: 1.2rem;
+            margin-bottom: 30px;
+            color: var(--accent);
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .nav-item {
+            padding: 12px 15px;
+            cursor: pointer;
+            border-radius: 8px;
+            transition: all 0.2s;
+            color: var(--text-dim);
+            font-weight: 500;
+        }
+        .nav-item:hover { background-color: #334155; color: var(--text); }
+        .nav-item.active { background-color: var(--accent); color: white; }
+
+        main {
+            flex: 1;
+            padding: 20px;
+            position: relative;
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+            overflow-y: auto;
+        }
+        .view-container { display: none; height: 100%; flex-direction: column; }
+        .view-container.active { display: flex; }
+
+        #live-viewport {
+            width: 100%;
+            max-width: 1000px;
+            aspect-ratio: 4/3;
+            background: #000;
+            border-radius: 12px;
+            margin: 0 auto;
+            box-shadow: 0 20px 50px rgba(0,0,0,0.5);
+            position: relative;
+            overflow: hidden;
+            border: 2px solid #334155;
+        }
+        #live-viewport img, #live-viewport video { width: 100%; height: 100%; object-fit: cover; }
+        
+        .overlay-controls {
+            position: absolute;
+            bottom: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            display: flex;
+            gap: 15px;
+            padding: 15px 25px;
+            background: rgba(15, 23, 42, 0.8);
+            backdrop-filter: blur(10px);
+            border-radius: 50px;
+            border: 1px solid rgba(255,255,255,0.1);
+        }
+        .btn {
+            border: none;
+            padding: 10px 20px;
+            border-radius: 25px;
+            cursor: pointer;
+            font-weight: 600;
+            transition: transform 0.1s, opacity 0.2s;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            color: white;
+        }
+        .btn:active { transform: scale(0.95); }
+        .btn-snapshot { background: var(--accent); }
+        .btn-record { background: var(--danger); }
+        .btn-record.recording { animation: pulse 1.5s infinite; }
+        @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.6; } 100% { opacity: 1; } }
+
+        .settings-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 20px;
+            max-width: 900px;
+            margin: 0 auto;
+            width: 100%;
+        }
+        .card {
+            background: var(--panel);
+            padding: 20px;
+            border-radius: 12px;
+            border: 1px solid #334155;
+        }
+        .card h3 { margin-top: 0; color: var(--text-dim); font-size: 0.9rem; text-transform: uppercase; letter-spacing: 1px; }
+        
+        .control-group { margin-bottom: 20px; display: flex; flex-direction: column; gap: 10px; }
+        .control-label { display: flex; justify-content: space-between; font-size: 0.9rem; }
+        .range-input { width: 100%; cursor: pointer; }
+        
+        .switch { position: relative; display: inline-block; width: 50px; height: 24px; }
+        .switch input { opacity: 0; width: 0; height: 0; }
+        .slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: #334155; transition: .4s; border-radius: 24px; }
+        .slider:before { position: absolute; content: ""; height: 18px; width: 18px; left: 3px; bottom: 3px; background-color: white; transition: .4s; border-radius: 50%; }
+        input:checked + .slider { background-color: var(--accent); }
+        input:checked + .slider:before { transform: translateX(26px); }
+
+        .status-bar { position: absolute; top: 20px; right: 20px; display: flex; gap: 10px; }
+        .badge { padding: 5px 12px; border-radius: 12px; font-size: 0.75rem; font-weight: bold; background: #334155; color: var(--text-dim); }
+        .badge-online { background: #065f46; color: #a7f3d0; }
+
+        /* AI Face Management */
+        .face-gallery {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+            gap: 15px;
+        }
+        .face-card {
+            background: #334155;
+            padding: 10px;
+            border-radius: 8px;
+            text-align: center;
+            position: relative;
+        }
+        .face-card img {
+            width: 80px;
+            height: 80px;
+            border-radius: 50%;
+            object-fit: cover;
+            border: 2px solid var(--accent);
+        }
+        .face-card .name { display: block; margin-top: 5px; font-size: 0.8rem; }
+        .face-card .del-btn {
+            position: absolute;
+            top: 5px;
+            right: 5px;
+            background: var(--danger);
+            color: white;
+            border: none;
+            border-radius: 50%;
+            width: 20px;
+            height: 20px;
+            cursor: pointer;
+            font-size: 10px;
+        }
+        .upload-face-area {
+            border: 2px dashed #334155;
+            padding: 20px;
+            text-align: center;
+            border-radius: 12px;
+            margin-bottom: 20px;
+            color: var(--text-dim);
+        }
+    </style>
+</head>
+<body>
+
+    <nav>
+        <h1><span>📷</span> CAM-CENTER</h1>
+        <div class="nav-item active" onclick="showView('live')">Live View</div>
+        <div class="nav-item" onclick="showView('faces')">Face Database</div>
+        <div class="nav-item" onclick="showView('controls')">Camera Controls</div>
+        <div class="nav-item" onclick="showView('archive')">Cloud Sync</div>
+        <div style="margin-top: auto; font-size: 0.7rem; color: var(--text-dim);">
+            System: <span style="color:var(--accent)">S-110-PROD</span><br>
+            Mode: <span style="color: #fbbf24">LIVE</span>
+        </div>
+    </nav>
+
+    <main>
+        <div class="status-bar">
+            <div class="badge badge-online">● ONLINE</div>
+            <div class="badge" id="face-status">Face: Scanning...</div>
+        </div>
+
+        <!-- LIVE VIEW -->
+        <div id="view-live" class="view-container active">
+            <div id="live-viewport">
+                <video id="mock-stream" autoplay muted loop muted>
+                    <source src="https://assets.mixkit.co/videos/stock-footage/free-video-1251-1160-view-from-a-security-camera.mp4" type="video/mp4">
+                </video>
+                <div class="overlay-controls">
+                    <button class="btn btn-snapshot" onclick="takeSnap()">📸 Snapshot</button>
+                    <button class="btn btn-record" id="rec-btn" onclick="toggleRec()">🔴 Record Clip</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- FACE DATABASE -->
+        <div id="view-faces" class="view-container">
+            <h2>Face Recognition Database</h2>
+            <div class="card">
+                <h3>Add Trusted Person</h3>
+                <div class="upload-face-area">
+                    <input type="file" id="face-input" style="display:none" accept="image/*" onchange="uploadFace()">
+                    <button class="btn btn-snapshot" onclick="document.getElementById('face-input').click()">Upload Face Photo</button>
+                    <div style="margin-top:10px">
+                        <input type="text" id="face-name" placeholder="Person's Name" style="padding:8px; border-radius:4px; border:1px solid #334155; background:#0f172a; color:white;">
+                    </div>
+                </div>
+                <h3>Known Faces</h3>
+                <div id="face-gallery" class="face-gallery">
+                    <!-- Loaded via JS -->
+                </div>
+            </div>
+        </div>
+
+        <!-- CONTROLS VIEW -->
+        <div id="view-controls" class="view-container">
+            <h2>Hardware Controls</h2>
+            <div class="settings-grid">
+                <div class="card">
+                    <h3>Image Adjustment</h3>
+                    <div class="control-group">
+                        <div class="control-label"><span>Brightness</span><span id="val-bright">0</span></div>
+                        <input type="range" class="range-input" min="-2" max="2" value="0" oninput="updateVal('bright', this.value)">
+                    </div>
+                    <div class="control-group">
+                        <div class="control-label"><span>Contrast</span><span id="val-cont">0</span></div>
+                        <input type="range" class="range-input" min="-2" max="2" value="0" oninput="updateVal('cont', this.value)">
+                    </div>
+                </div>
+                <div class="card">
+                    <h3>AI Behavior</h3>
+                    <div class="control-group" style="flex-direction: row; justify-content: space-between; align-items: center;">
+                        <span>Record Unknowns Only</span>
+                        <label class="switch">
+                            <input type="checkbox" checked>
+                            <span class="slider"></span>
+                        </label>
+                    </div>
+                </div>
+                <div class="card">
+                    <h3>System</h3>
+                    <button class="btn" style="background:var(--danger); width:100%; justify-content:center;" onclick="confirmReboot()">⚠️ Reboot Camera</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- ARCHIVE VIEW -->
+        <div id="view-archive" class="view-container">
+            <h2>Cloud Sync (Proton Drive)</h2>
+            <div class="card" style="max-width:600px; margin:0 auto; text-align:center;">
+                <p>Connection State: <b style="color:var(--accent)">Healthy</b></p>
+                <button class="btn btn-snapshot" style="margin: 20px auto; display: block;" onclick="triggerSync()">⚡ Trigger Manual Sync</button>
+                <div id="sync-log" style="background:#0f172a; padding:15px; border-radius:8px; font-family:monospace; text-align:left; font-size:0.8rem; color:#10b981; height: 150px; overflow-y: auto;">
+                    [INFO] System Initialized. Waiting for trigger...<br>
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <script>
+        function showView(viewId) {
+            document.querySelectorAll('.view-container').forEach(v => v.classList.remove('active'));
+            document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+            document.getElementById('view-' + viewId).classList.add('active');
+            event.target.classList.add('active');
+            if(viewId === 'faces') loadFaces();
+        }
+
+        function updateVal(id, val) {
+            document.getElementById('val-' + id).innerText = val;
+        }
+
+        function takeSnap() { alert('📸 Simulation: Snapshot captured'); }
+
+        function toggleRec() {
+            const btn = document.getElementById('rec-btn');
+            btn.classList.toggle('recording');
+            btn.innerText = btn.classList.contains('recording') ? '⏹ Stop Recording' : '🔴 Record Clip';
+        }
+
+        function confirmReboot() { if(confirm('Reboot Camera?')) alert('🔄 Rebooting...'); }
+
+        async function loadFaces() {
+            const res = await fetch('manage_faces.php?action=list');
+            const names = await res.json();
+            const gallery = document.getElementById('face-gallery');
+            gallery.innerHTML = '';
+            names.forEach(name => {
+                gallery.innerHTML += `
+                    <div class="face-card">
+                        <img src="uploads/known_faces/${name}.jpg" onerror="this.src='https://via.placeholder.com/80'">
+                        <span class="name">${name}</span>
+                        <button class="del-btn" onclick="deleteFace('${name}')">×</button>
+                    </div>`;
+            });
+        }
+
+        async function uploadFace() {
+            const name = document.getElementById('face-name').value;
+            const file = document.getElementById('face-input').files[0];
+            if(!name || !file) return alert('Please enter a name and select a photo');
+            
+            const formData = new FormData();
+            formData.append('name', name);
+            formData.append('image', file);
+            
+            const res = await fetch('manage_faces.php?action=add', { method: 'POST', body: formData });
+            if(res.ok) {
+                alert('Face added to database!');
+                loadFaces();
+            }
+        }
+
+        async function deleteFace(name) {
+            if(confirm('Remove ' + name + ' from trusted list?')) {
+                await fetch(`manage_faces.php?action=delete&name=${name}`);
+                loadFaces();
+            }
+        }
+
+        async function triggerSync() {
+            const log = document.getElementById('sync-log');
+            log.innerHTML += `[${new Date().toLocaleTimeString()}] Triggering manual sync...<br>`;
+            const res = await fetch('manage_faces.php?action=sync');
+            if(res.ok) log.innerHTML += `[${new Date().toLocaleTimeString()}] Sync command sent to Brain container.<br>`;
+            log.scrollTop = log.scrollHeight;
+        }
+
+        setInterval(() => {
+            const status = document.getElementById('face-status');
+            const states = ['Scanning...', 'Face Detected! Recording...', 'Scanning...'];
+            status.innerText = states[Math.floor(Math.random() * states.length)];
+            status.style.color = status.innerText.includes('Detected') ? '#ef4444' : '#94a3b8';
+        }, 5000);
+    </script>
+</body>
+</html>

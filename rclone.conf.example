@@ -1,0 +1,11 @@
+[remote_name]
+type = protondrive
+username = your_email@proton.me
+password = YOUR_ENCRYPTED_PASSWORD
+mailbox_password = YOUR_ENCRYPTED_MAILBOX_PASSWORD
+replace_existing_draft = true
+description = proton-drive
+client_uid = your_uid
+client_access_token = your_token
+client_refresh_token = your_refresh_token
+client_salted_key_pass = your_salted_key
