@@ -2,13 +2,55 @@
 
 A high-intelligence, distributed camera system that combines ESP32-CAM hardware with a local AI "Brain" for facial recognition and automatic cloud backup to Proton Drive.
 
-## 🏗️ Architecture
-`ESP32-CAM` $\xrightarrow{\text{MJPEG/HTTP}}$ `Local Server (.110)` $\xrightarrow{\text{AI Analysis}}$ `Proton Drive`
+## 🗺️ System Architecture
 
-- **Edge Device:** ESP32-CAM handles motion detection and live streaming.
-- **The Brain:** A Dockerized Python service using `face-recognition` (dlib) to distinguish between trusted faces and strangers.
-- **The Hub:** Nginx/PHP server providing a management dashboard and command queue.
-- **Cloud Sync:** Rclone integration for secure, automated backups to Proton Drive.
+```mermaid
+graph TD
+    subgraph "Edge: Camera Node"
+        ESP[ESP32-CAM]
+        ESP -->|MJPEG Stream| UI
+        ESP -->|JPEG POST| UP[upload.php]
+        ESP -.->|Poll Commands| CMD[commands.json]
+        ESP -.->|Poll Settings| SET[settings.json]
+    end
+
+    subgraph "Hub: Local Server (.110)"
+        direction TB
+        subgraph "Web Layer (Docker)"
+            UI[Management Dashboard]
+            UP --> DB[(Local Storage /uploads)]
+            UI --> UP
+        end
+        
+        subgraph "AI Brain (Docker Sidecar)"
+            S[File Watcher] -->|Scan JPEGs| DB
+            S -->|Face Encoding| COM[Comparison Engine]
+            COM -->|Unknown Face| CMD
+            COM -->|Known Face| LOG[Log Entry]
+            DB_FACES[(Known Faces DB)] <--> COM
+        end
+        
+        subgraph "Cloud Pipe"
+            SYNC[Rclone Sync]
+            DB --> SYNC
+        end
+    end
+
+    subgraph "Cloud: Backup"
+        SYNC -->|Encrypted Sync| PD[Proton Drive]
+    end
+
+    style ESP fill:#f9f,stroke:#333,stroke-width:2px
+    style AI Brain fill:#bbf,stroke:#333,stroke-width:2px
+    style PD fill:#dfd,stroke:#333,stroke-width:2px
+```
+
+### How it Works:
+1. **The Stream:** The ESP32 hosts a lightweight MJPEG stream that the Dashboard connects to for "Live View."
+2. **The Detection:** The ESP32 sends images to `upload.php` on motion.
+3. **The Brain:** The AI Brain container watches the `uploads` folder. It extracts face encodings and compares them to the `Known Faces` database.
+4. **The Action:** If a face is **Unknown**, the Brain writes `RECORD_VIDEO` to `commands.json`. The ESP32 polls this file, sees the command, and captures a high-res clip.
+5. **The Backup:** Every 15 minutes, Rclone mirrors the local `uploads` folder to Proton Drive for permanent, encrypted storage.
 
 ## 🚀 Key Features
 - **Live View:** Low-latency MJPEG streaming directly to the browser.
@@ -31,7 +73,7 @@ docker compose up -d
 
 ### 2. Face Database
 1. Navigate to the **Face Database** tab on the dashboard.
-2. UploadPhotos of trusted people (e.g., `john.jpg`, `jane.jpg`).
+2. Upload Photos of trusted people (e.g., `john.jpg`, `jane.jpg`).
 3. The AI Brain will automatically encode these fingerprints for matching.
 
 ### 3. Cloud Configuration
