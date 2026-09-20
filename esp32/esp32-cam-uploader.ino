@@ -1,43 +1,74 @@
 /*
-  ESP32-CAM Multi-Function System v4
-  - Live MJPEG Streaming
-  - Command Polling (Record/Reboot/Settings)
-  - Dual-rate Motion Uploads
-  - STATIC IP Configuration
-  - Targeted for Local Server 10.10.10.110:8787
+  ESP32-CAM uploader — v5
+
+  Fixes applied to v4:
+
+  1. CRLF BUG: every HTTP header in the MJPEG handler was written as
+     "...\\r\\n", which the compiler turns into a literal backslash-r
+     backslash-n rather than CRLF. The stream emitted malformed HTTP that no
+     browser could parse, so it had never worked. Serial.printf("\\n") was
+     affected too.
+
+  2. BLOCKING STREAM: handleStream() looped `while (client.connected())`,
+     which froze loop() for the entire viewing session. Motion uploads and
+     command polling stopped the moment anyone opened the live view — a
+     monitoring system that went blind whenever you looked at it. The on-device
+     web server was also completely unauthenticated, giving anyone on the LAN
+     the camera feed.
+
+     Both problems are removed by deleting the on-device server. The dashboard
+     now shows the latest frame from the server (frame.php), which the camera
+     already uploads at up to 5 fps during motion. If a true MJPEG stream is
+     wanted later, it must run in its own FreeRTOS task pinned to the other
+     core, not inside loop().
+
+  3. UPLOAD MISMATCH: unchanged on this side (raw JPEG body), but upload.php
+     now actually accepts it. Previously the server demanded multipart and
+     rejected every frame with HTTP 400.
+
+  4. AUTH: uploads and polling now send X-Cam-Token. The endpoints were
+     previously open to anyone who could reach the server.
+
+  5. COMMANDS: the old code polled a single global commands.json that nothing
+     ever cleared, so one RECORD_VIDEO re-fired every 2 seconds forever. The
+     queue is now per-camera and consumed server-side on read. RECORD_VIDEO is
+     also implemented (a high-rate burst) instead of being a TODO comment.
+
+  6. WIFI: v4 only connected at boot. If the link dropped afterwards the device
+     ran blind forever. There is now a reconnect path with a reboot backstop.
+
+  7. SECRETS: credentials moved to secrets.h (gitignored).
+
+  Setup: copy secrets.h.example to secrets.h and edit it. Set BOARD_TYPE below.
+
+  Requires arduino-esp32 core >= 2.0.4. Older cores spell the SCCB pin fields
+  `pin_sscb_sda` / `pin_sscb_scl`; if the sketch fails to compile on those two
+  lines, your core is too old — update it rather than renaming the fields.
 */
 
 #include "esp_camera.h"
 #include <WiFi.h>
 #include <HTTPClient.h>
-#include <WebServer.h>
 
-// ── CONFIG ──────────────────────────────────────────
+#include "secrets.h"
+
+// ── Board selection ─────────────────────────────────
+// 0 = AI Thinker ESP32-CAM, 1 = Freenove WROVER-DEV
 #define BOARD_TYPE 0
 
-// WiFi & Static IP Configuration
-const char* ssid       = "ludo5";
-const char* pass       = "Vanillalotus849";
+// ── Timing ──────────────────────────────────────────
+static const uint32_t IDLE_INTERVAL_MS   = 1000;  // heartbeat frame rate
+static const uint32_t ACTIVE_INTERVAL_MS = 200;   // 5 fps while motion is live
+static const uint32_t COOLDOWN_MS        = 5000;  // motion latch after last hit
+static const uint32_t CMD_POLL_MS        = 2000;
+static const uint32_t SETTINGS_POLL_MS   = 30000;
+static const uint32_t BURST_DURATION_MS  = 10000; // RECORD_VIDEO burst length
+static const uint32_t HTTP_TIMEOUT_MS    = 5000;
+static const uint32_t WIFI_ATTEMPT_MS    = 15000;
 
-IPAddress local_IP     = IPAddress(10, 10, 10, 2);
-IPAddress gateway      = IPAddress(10, 10, 10, 1);
-IPAddress subnet       = IPAddress(255, 255, 255, 0);
-IPAddress primaryDNS   = IPAddress(10, 10, 10, 10);
-IPAddress secondaryDNS = IPAddress(0, 0, 0, 0); // No secondary DNS
-
-const char* SERVER_IP     = "10.10.10.110";
-const int   SERVER_PORT   = 8787;
-const char* CAM_ID        = "cam1";
-
-const int IDLE_INTERVAL_MS    = 1000;  
-const int ACTIVE_INTERVAL_MS   = 200;   
-const int COOLDOWN_MS          = 5000;  
-const int MOTION_THRESHOLD_PCT = 12;   
-
-// Polling Intervals
-const int CMD_POLL_INTERVAL    = 2000; 
-const int SETTINGS_POLL_INTERVAL = 10000; 
-// ────────────────────────────────────────────────────
+// Motion detection tunables (see detectMotion() for the caveat).
+static const int  DEFAULT_MOTION_PCT     = 12;
+static const uint8_t MOTION_CONFIRM_HITS = 2;
 
 #if BOARD_TYPE == 0
   #define PWDN_GPIO_NUM    32
@@ -77,72 +108,239 @@ const int SETTINGS_POLL_INTERVAL = 10000;
   #define LED_FLASH        -1
 #endif
 
-bool motionActive = false;
-unsigned long lastMotionTime = 0;
-size_t lastJpegSize = 0;
-WebServer server(80); 
+// ── State ───────────────────────────────────────────
+static bool     motionActive    = false;
+static uint32_t lastMotionTime  = 0;
+static uint32_t burstUntil      = 0;
+static size_t   baselineSize    = 0;
+static uint8_t  motionHits      = 0;
+static int      motionPct       = DEFAULT_MOTION_PCT;
+static uint8_t  consecutiveUploadFailures = 0;
 
-void handleStream() {
-  WiFiClient client = server.client();
-  client.print("HTTP/1.1 200 OK\\r\\n");
-  client.print("Content-Type: multipart/x-mixed-replace; boundary=frame\\r\\n\\r\\n");
-  
-  while (client.connected()) {
-    camera_fb_t * fb = esp_camera_fb_get();
-    if (!fb) continue;
-    
-    client.print("--frame\\r\\n");
-    client.print("Content-Type: image/jpeg\\r\\n");
-    client.print("Content-Length: " + String(fb->len) + "\\r\\n\\r\\n");
-    client.write(fb->buf, fb->len);
-    client.print("\\r\\n");
-    
-    esp_camera_fb_return(fb);
-    delay(100); 
+static String baseUrl() {
+  return String("http://") + SERVER_IP + ":" + String(SERVER_PORT);
+}
+
+// ─────────────────────────────────────────────────────
+// WiFi
+// ─────────────────────────────────────────────────────
+static bool connectWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);          // sleep adds seconds of latency to uploads
+
+#if USE_STATIC_IP
+  IPAddress ip(STATIC_IP_OCTETS);
+  IPAddress gw(GATEWAY_OCTETS);
+  IPAddress mask(SUBNET_OCTETS);
+  IPAddress dns(DNS_OCTETS);
+  if (!WiFi.config(ip, gw, mask, dns)) {
+    Serial.println("Static IP config failed, falling back to DHCP");
+  }
+#endif
+
+  Serial.printf("Connecting to %s", WIFI_SSID);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  uint32_t start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < WIFI_ATTEMPT_MS) {
+    delay(250);
+    Serial.print(".");
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("\nConnected. IP: %s\n", WiFi.localIP().toString().c_str());
+    return true;
+  }
+  Serial.println("\nWiFi connection failed");
+  return false;
+}
+
+// Called from loop(). v4 had no recovery path at all once the link dropped.
+static void ensureWiFi() {
+  if (WiFi.status() == WL_CONNECTED) return;
+
+  static uint8_t failures = 0;
+  Serial.println("WiFi lost, reconnecting...");
+  WiFi.disconnect();
+  if (connectWiFi()) {
+    failures = 0;
+    return;
+  }
+  if (++failures >= 3) {
+    Serial.println("WiFi unrecoverable, restarting");
+    delay(1000);
+    ESP.restart();
   }
 }
 
-void checkCommands() {
+// ─────────────────────────────────────────────────────
+// HTTP helpers
+// ─────────────────────────────────────────────────────
+static bool uploadFrame(camera_fb_t* fb, bool motion) {
   HTTPClient http;
-  String url = "http://" + String(SERVER_IP) + ":" + String(SERVER_PORT) + "/uploads/commands.json";
-  http.begin(url);
-  int code = http.GET();
-  
-  if (code == 200) {
+  String url = baseUrl() + "/upload.php?camId=" + CAM_ID + (motion ? "&motion=1" : "");
+
+  if (!http.begin(url)) return false;
+  http.setTimeout(HTTP_TIMEOUT_MS);
+  http.addHeader("Content-Type", "image/jpeg");
+  http.addHeader("X-Cam-Token", CAM_TOKEN);
+
+  int code = http.POST(fb->buf, fb->len);
+  if (code != 200) {
+    Serial.printf("Upload failed: HTTP %d\n", code);
+  }
+  http.end();
+  return code == 200;
+}
+
+// Minimal integer extractor, so we do not need to pull in a JSON library.
+// Returns `fallback` when the key is absent or unparseable.
+static int jsonInt(const String& body, const char* key, int fallback) {
+  String needle = String("\"") + key + "\"";
+  int at = body.indexOf(needle);
+  if (at < 0) return fallback;
+  at = body.indexOf(':', at + needle.length());
+  if (at < 0) return fallback;
+
+  int i = at + 1;
+  while (i < (int)body.length() && (body[i] == ' ' || body[i] == '"')) i++;
+
+  bool negative = (i < (int)body.length() && body[i] == '-');
+  if (negative) i++;
+
+  int start = i;
+  while (i < (int)body.length() && isDigit(body[i])) i++;
+  if (i == start) return fallback;
+
+  int value = body.substring(start, i).toInt();
+  return negative ? -value : value;
+}
+
+static bool jsonHasAction(const String& body, const char* action) {
+  return body.indexOf(String("\"") + action + "\"") >= 0;
+}
+
+static void applySettings(const String& body) {
+  sensor_t* s = esp_camera_sensor_get();
+  if (!s) return;
+
+  s->set_brightness(s, jsonInt(body, "brightness", 0));
+  s->set_contrast(s,   jsonInt(body, "contrast", 0));
+  s->set_saturation(s, jsonInt(body, "saturation", 0));
+  s->set_quality(s,    jsonInt(body, "quality", 12));
+  s->set_vflip(s,      jsonInt(body, "vflip", 1));
+  s->set_hmirror(s,    jsonInt(body, "hmirror", 0));
+
+  int framesize = jsonInt(body, "framesize", FRAMESIZE_SVGA);
+  if (framesize >= FRAMESIZE_QVGA && framesize <= FRAMESIZE_UXGA) {
+    s->set_framesize(s, (framesize_t)framesize);
+    // Frame size changes invalidate the size baseline.
+    baselineSize = 0;
+  }
+
+  int pct = jsonInt(body, "motionPct", DEFAULT_MOTION_PCT);
+  motionPct = constrain(pct, 1, 90);
+}
+
+static void syncSettings() {
+  HTTPClient http;
+  String url = baseUrl() + "/settings.php?camId=" + CAM_ID;
+  if (!http.begin(url)) return;
+  http.setTimeout(HTTP_TIMEOUT_MS);
+  http.addHeader("X-Cam-Token", CAM_TOKEN);
+
+  if (http.GET() == 200) {
+    applySettings(http.getString());
+  }
+  http.end();
+}
+
+static void checkCommands() {
+  HTTPClient http;
+  String url = baseUrl() + "/commands.php?camId=" + CAM_ID;
+  if (!http.begin(url)) return;
+  http.setTimeout(HTTP_TIMEOUT_MS);
+  http.addHeader("X-Cam-Token", CAM_TOKEN);
+
+  if (http.GET() == 200) {
     String payload = http.getString();
-    if (payload.indexOf("RECORD_VIDEO") != -1) {
-      Serial.println("[CMD] Video Recording Triggered!");
-      // Recording logic can be added here
-    } else if (payload.indexOf("REBOOT") != -1) {
-      Serial.println("[CMD] Rebooting...");
-      delay(500);
+
+    // The server deletes the command as it hands it over, so each one is
+    // delivered at most once and cannot re-trigger on the next poll.
+    if (jsonHasAction(payload, "REBOOT")) {
+      Serial.println("[CMD] Reboot requested");
+      http.end();
+      delay(250);
       ESP.restart();
+    } else if (jsonHasAction(payload, "RECORD_VIDEO")) {
+      // No SD card in this build, so "record" means a high-rate burst of
+      // motion-flagged frames, which the server archives as an event.
+      Serial.println("[CMD] Record burst requested");
+      burstUntil = millis() + BURST_DURATION_MS;
+      motionActive = true;
+      lastMotionTime = millis();
+    } else if (jsonHasAction(payload, "FLASH_ON")) {
+#if LED_FLASH >= 0
+      digitalWrite(LED_FLASH, HIGH);
+#endif
+    } else if (jsonHasAction(payload, "FLASH_OFF")) {
+#if LED_FLASH >= 0
+      digitalWrite(LED_FLASH, LOW);
+#endif
     }
   }
   http.end();
 }
 
-void syncSettings() {
-  HTTPClient http;
-  String url = "http://" + String(SERVER_IP) + ":" + String(SERVER_PORT) + "/uploads/settings.json";
-  http.begin(url);
-  if (http.GET() == 200) {
-    String payload = http.getString();
-    sensor_t* s = esp_camera_sensor_get();
-    // Logic to parse settings.json and apply s->set_brightness etc.
+// ─────────────────────────────────────────────────────
+// Motion detection
+//
+// CAVEAT: this compares compressed JPEG sizes, which is a proxy for scene
+// complexity, not for movement. It reacts to lights switching on and misses
+// motion that does not change image entropy. It is kept because decoding
+// frames on-device is too slow, but the server-side face recognition is the
+// real filter. v4 additionally left the baseline at 0, so the very first frame
+// always reported motion, and it compared against the immediately preceding
+// frame, making sustained movement look like stillness.
+// ─────────────────────────────────────────────────────
+static bool detectMotion(size_t frameSize) {
+  if (baselineSize == 0) {
+    baselineSize = frameSize;      // prime on first frame, do not fire
+    return false;
   }
-  http.end();
+
+  size_t delta = (frameSize > baselineSize) ? frameSize - baselineSize
+                                            : baselineSize - frameSize;
+  bool exceeded = delta > (baselineSize * (size_t)motionPct / 100);
+
+  if (exceeded) {
+    // Require consecutive hits so a single compression blip is not an event.
+    if (motionHits < 255) motionHits++;
+  } else {
+    motionHits = 0;
+    // Drift the baseline towards the quiet scene (exponential moving average),
+    // so slow changes in daylight do not read as permanent motion.
+    baselineSize = (baselineSize * 7 + frameSize) / 8;
+  }
+
+  return motionHits >= MOTION_CONFIRM_HITS;
 }
 
+// ─────────────────────────────────────────────────────
+// Setup / loop
+// ─────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
-  
-  // Configure Static IP
-  if (!WiFi.config(local_IP, gateway, subnet, primaryDNS, secondaryDNS)) {
-    Serial.println("STA Failed to configure Static IP");
-  }
+  delay(100);
+  Serial.println();
+  Serial.printf("ESP32-CAM uploader v5 — camera id: %s\n", CAM_ID);
 
-  camera_config_t config;
+#if LED_FLASH >= 0
+  pinMode(LED_FLASH, OUTPUT);
+  digitalWrite(LED_FLASH, LOW);
+#endif
+
+  camera_config_t config = {};
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer   = LEDC_TIMER_0;
   config.pin_d0       = Y2_GPIO_NUM;
@@ -157,87 +355,91 @@ void setup() {
   config.pin_pclk     = PCLK_GPIO_NUM;
   config.pin_vsync    = VSYNC_GPIO_NUM;
   config.pin_href     = HREF_GPIO_NUM;
-  config.pin_sscb_sda = SIOD_GPIO_NUM;
-  config.pin_sscb_scl = SIOC_GPIO_NUM;
+  config.pin_sccb_sda = SIOD_GPIO_NUM;
+  config.pin_sccb_scl = SIOC_GPIO_NUM;
   config.pin_pwdn     = PWDN_GPIO_NUM;
   config.pin_reset    = RESET_GPIO_NUM;
   config.xclk_freq_hz = 20000000;
   config.pixel_format = PIXFORMAT_JPEG;
   config.frame_size   = FRAMESIZE_SVGA;
   config.jpeg_quality = 12;
-  config.fb_count     = 2;
+  config.fb_count     = psramFound() ? 2 : 1;
+  config.fb_location  = psramFound() ? CAMERA_FB_IN_PSRAM : CAMERA_FB_IN_DRAM;
+  config.grab_mode    = CAMERA_GRAB_LATEST;
 
-  if (esp_camera_init(&config) != ESP_OK) return;
-
-  sensor_t* s = esp_camera_sensor_get();
-  s->set_vflip(s, 1);
-
-  Serial.printf("Connecting to %s...", ssid);
-  WiFi.begin(ssid, pass);
-  unsigned long start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
-    delay(500);
-    Serial.print(".");
-  }
-  
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.printf("\\nWiFi connected. IP: %s\\n", WiFi.localIP().toString().c_str());
-  } else {
-    Serial.println("\\nWiFi failed. Restarting...");
-    delay(5000);
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    // v4 returned silently here, leaving a device that looked alive but had no
+    // camera. Restart so the watchdog story is honest.
+    Serial.printf("Camera init failed (0x%x), restarting\n", err);
+    delay(3000);
     ESP.restart();
   }
-  
-  server.on("/stream", handleStream);
-  server.begin();
-}
 
-bool uploadFrame(camera_fb_t* fb, bool motion) {
-  HTTPClient http;
-  String url = "http://" + String(SERVER_IP) + ":" + String(SERVER_PORT) + "/upload.php?camId=" + CAM_ID;
-  if (motion) url += "&motion=1";
-  http.begin(url);
-  http.addHeader("Content-Type", "image/jpeg");
-  int code = http.POST((uint8_t*)fb->buf, fb->len);
-  http.end();
-  return (code == 200);
+  sensor_t* s = esp_camera_sensor_get();
+  if (s) s->set_vflip(s, 1);
+
+  if (!connectWiFi()) {
+    delay(3000);
+    ESP.restart();
+  }
+
+  syncSettings();
 }
 
 void loop() {
-  server.handleClient(); 
-  
-  unsigned long now = millis();
-  static unsigned long lastCapture = 0;
-  static unsigned long lastCmdPoll = 0;
-  static unsigned long lastSettingsSync = 0;
+  ensureWiFi();
 
-  int interval = motionActive ? ACTIVE_INTERVAL_MS : IDLE_INTERVAL_MS;
+  uint32_t now = millis();
+  static uint32_t lastCapture = 0;
+  static uint32_t lastCmdPoll = 0;
+  static uint32_t lastSettingsSync = 0;
+
+  bool bursting = (int32_t)(burstUntil - now) > 0;
+  uint32_t interval = (motionActive || bursting) ? ACTIVE_INTERVAL_MS : IDLE_INTERVAL_MS;
+
   if (now - lastCapture >= interval) {
+    lastCapture = now;
+
     camera_fb_t* fb = esp_camera_fb_get();
     if (fb) {
-      bool motion = (abs((int)fb->len - (int)lastJpegSize) > (lastJpegSize * MOTION_THRESHOLD_PCT / 100));
-      lastJpegSize = fb->len;
-      
+      bool motion = detectMotion(fb->len);
+
       if (motion) {
         motionActive = true;
         lastMotionTime = now;
-      } else if (motionActive && now - lastMotionTime > COOLDOWN_MS) {
+      } else if (motionActive && !bursting && now - lastMotionTime > COOLDOWN_MS) {
         motionActive = false;
       }
-      
-      uploadFrame(fb, motion);
+
+      // Archive during a burst too, so a RECORD_VIDEO command produces frames.
+      bool flagMotion = motion || bursting;
+
+      if (uploadFrame(fb, flagMotion)) {
+        consecutiveUploadFailures = 0;
+      } else if (++consecutiveUploadFailures >= 30) {
+        // Persistent failure usually means a wedged TCP stack.
+        Serial.println("Too many upload failures, restarting");
+        esp_camera_fb_return(fb);
+        delay(500);
+        ESP.restart();
+      }
+
       esp_camera_fb_return(fb);
+    } else {
+      Serial.println("Frame capture failed");
     }
-    lastCapture = now;
   }
 
-  if (now - lastCmdPoll >= CMD_POLL_INTERVAL) {
-     checkCommands();
-     lastCmdPoll = now;
+  if (now - lastCmdPoll >= CMD_POLL_MS) {
+    lastCmdPoll = now;
+    checkCommands();
   }
 
-  if (now - lastSettingsSync >= SETTINGS_POLL_INTERVAL) {
-     syncSettings();
-     lastSettingsSync = now;
+  if (now - lastSettingsSync >= SETTINGS_POLL_MS) {
+    lastSettingsSync = now;
+    syncSettings();
   }
+
+  delay(10);   // yield to the WiFi stack and keep the watchdog fed
 }

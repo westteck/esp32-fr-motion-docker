@@ -1,0 +1,63 @@
+# AI Brain image.
+#
+# The original stack ran this instead, as the container's `command`:
+#
+#   apt-get update && apt-get install -y curl unzip &&
+#   curl -L https://rclone.org/install.sh | bash &&
+#   pip install opencv-python-headless face-recognition && python3 brain_script.py
+#
+# Three problems: it piped an unpinned remote script into bash on every restart,
+# it re-ran the whole install on every restart, and it could not succeed at all
+# because dlib (a face-recognition dependency) needs cmake and a C++ toolchain
+# that python:3.11-slim does not ship. Building the wheels here makes it a
+# one-off, cached, reproducible cost.
+
+# ── rclone: copied from the official image, so no curl | bash ────────────────
+FROM rclone/rclone:1.68 AS rclone
+
+# ── Build stage: compile dlib and friends into wheels ───────────────────────
+FROM python:3.11-slim AS builder
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      build-essential \
+      cmake \
+      libopenblas-dev \
+      liblapack-dev \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt /tmp/requirements.txt
+RUN pip wheel --no-cache-dir --wheel-dir /wheels -r /tmp/requirements.txt
+
+# ── Runtime stage ───────────────────────────────────────────────────────────
+FROM python:3.11-slim
+
+# libgomp1 is dlib's OpenMP runtime; the BLAS libs are its linear algebra
+# backend. No compiler in the final image.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      libgomp1 \
+      libopenblas0 \
+      liblapack3 \
+      ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY --from=rclone /usr/local/bin/rclone /usr/local/bin/rclone
+
+COPY --from=builder /wheels /wheels
+COPY requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir --no-index --find-links=/wheels -r /tmp/requirements.txt \
+ && rm -rf /wheels /tmp/requirements.txt
+
+WORKDIR /app
+COPY brain_script.py /app/brain_script.py
+
+ENV PYTHONUNBUFFERED=1 \
+    DATA_ROOT=/app/data \
+    RCLONE_CONFIG=/config/rclone.conf
+
+# Runs as root deliberately: it shares a bind mount with php-fpm's www-data and
+# must read files that user creates. A mismatched non-root UID fails silently
+# here, which is worse than the alternative. The container has no network
+# ingress and no shell exposure.
+CMD ["python3", "/app/brain_script.py"]

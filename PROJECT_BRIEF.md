@@ -1,64 +1,102 @@
-# ESP32-CAM Multi-Camera System — Project Brief
+# Project Brief — ESP32-CAM Motion & Face Recognition
+
+Internal handoff notes. User-facing setup lives in `README.md`.
 
 ## Goal
-3 ESP32-CAM modules at a friend's house upload images to raggsy.com. Web dashboard for live viewing. Motion-triggered recording.
 
-## Architecture
+ESP32-CAM modules upload motion-triggered frames to a local server. The server
+runs face recognition, asks the camera for a capture burst when it sees an
+unknown face, and backs everything up to Proton Drive.
+
+## Deployment model
+
+One model only: **Docker stack on a local server**, reached at
+`http://<server-ip>:8787/`.
+
+A second, incompatible deployment (remote Linode, `raggsy.com/cam/`, aaPanel,
+`deploy.sh`, no AI) previously coexisted in this repo with no indication of which
+was current. Its files conflicted with the Docker model — `deploy.sh` never
+copied `manage_faces.php` or the dashboard the README pointed at, and the old
+dashboard fetched absolute `/cameras.php` paths that 404'd under the `/cam/`
+subdirectory it was installed into. The Linode model has been removed.
+
+## Components
+
+| Path | Role |
+|---|---|
+| `esp32/esp32-cam-uploader.ino` | Firmware: capture, motion heuristic, upload, command/settings polling |
+| `esp32/secrets.h.example` | Credential template; real `secrets.h` is gitignored |
+| `server/public/*.php` | HTTP API (see the endpoint table in `README.md`) |
+| `server/public/lib/common.php` | Auth, input validation, atomic JSON, path containment |
+| `server/public/index.html` | Dashboard |
+| `brain_script.py` | Face recognition loop + rclone backup |
+| `Dockerfile.brain` | Pinned image for dlib/face_recognition and the rclone binary |
+| `docker/php-custom.ini` | PHP limits and hardening |
+
+## Storage layout
+
+Everything mutable lives under one data root, bind-mounted into both the web and
+brain containers (`$DATA_DIR`, default `./data`):
+
 ```
-ESP32-CAM (cam1/cam2/cam3) ──WiFi──▶ raggsy.com/cam/upload.php
-                                          │
-                                   stores JPEGs on disk
-                                          │
-                                   raggsy.com/cam/ — dashboard
+data/
+  uploads/
+    <camId>.jpg                latest frame
+    <camId>/<millis>.jpg       archived motion frames
+    <camId>_events.json        motion timeline
+    <camId>_status.json        liveness + motion flag
+    <camId>_settings.json      sensor settings
+    <camId>_command.json       pending command (deleted when collected)
+  known_faces/<name>.jpg       face database
+  state/
+    brain_status.json           heartbeat, counters, last error
+    detections.json             recent recognition results
+    sync_status.json            backup outcome
+    force_sync.json             manual sync request flag
 ```
 
-## What's Built
+A single shared root is deliberate. The two directories were previously split
+(`uploads/known_faces` for PHP, `known_faces` for the brain), so faces added via
+the dashboard never reached the recogniser and every face matched as Unknown.
 
-### ESP32 Firmware (`esp32/esp32-cam-uploader.ino`)
-- Software motion detection (JPEG size differencing, 12% threshold)
-- Dual capture rate: idle 1fps, active 5fps (200ms interval)
-- 5s cooldown after motion stops
-- Multi-WiFi: tries `ludo` (home) then `ATT8Fdp4tz` (Phil's), 15s timeout each, reboots if all fail
-- Board selector: `BOARD_TYPE 0` = AI Thinker ESP32-CAM, `1` = Freenove WROVER-DEV
-- Posts to `http://raggsy.com/cam/upload.php?camId=camX&motion=1`
-- Per-device config: change `CAM_ID` and `BOARD_TYPE` before flashing
+## Auth model
 
-### Server (`server/public/`) — PHP, zero dependencies
-| File | Purpose |
-|------|---------|
-| `upload.php` | Receives JPEG, saves latest frame, archives motion frames to `camId/` dir, writes `camId_events.json` |
-| `frame.php` | Serves latest frame or historical event frame (`?event=timestamp.jpg`) |
-| `cameras.php` | JSON list of cameras with lastFrame timestamp and motion state |
-| `events.php` | JSON motion event timeline per camera |
-| `index.html` | Dashboard: live grid, red glow on motion, motion badge, clickable event thumbnails, fullscreen viewer |
+- `CAM_TOKEN` — devices. Upload, command poll, settings read.
+- `ADMIN_TOKEN` — dashboard. Everything else, plus a session cookie so `<img>`
+  tags can load frames.
+- Both are required; endpoints fail closed while unset.
+- A camera token is never sufficient for a management action: the hardware is
+  physically reachable and its flash can be dumped.
 
-### Deploy
-- Repo: `git@github.com:westteck/phil-esp32-cam.git`
-- Linode: cloned at `~/esp32-cam-server`
-- Deploy: `bash server/deploy.sh` (needs sudo, copies to `/www/wwwroot/raggsy.com/cam/`)
-- Update workflow: `git pull && bash server/deploy.sh`
+## Known limitations
 
-## What's NOT Done
-- ESP32s not yet flashed (Arduino IDE 1.8.19 installed locally, CP2102 at `/dev/ttyUSB0`)
-- Deploy script not yet run on linode (needs sudo password)
-- No Telegram integration
-- No HTTPS (HTTP only, nginx already on server)
+- **Motion detection** compares compressed JPEG sizes, a proxy for scene
+  complexity rather than movement. It reacts to lighting changes and misses
+  low-entropy motion. Server-side face recognition is the accurate filter.
+  Improving this on-device means decoding frames, which the hardware is too slow
+  for at useful frame rates.
+- **No on-device MJPEG stream.** Removed; see `README.md` for why and what a
+  correct implementation would require.
+- **No video files.** `RECORD_VIDEO` produces a 10-second 5 fps frame burst.
+- **No HTTPS.** LAN only. `SESSION_COOKIE_SECURE=1` once TLS is in front.
+- **The brain runs as root** in its container so it can read files written by
+  php-fpm's `www-data` in the shared bind mount. A mismatched non-root UID fails
+  silently, which is worse.
+- **Single point of failure.** If the server is down the cameras buffer nothing;
+  frames are lost rather than queued.
 
-## Flashing Instructions (for reference)
-1. Arduino IDE → Preferences → add `https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json`
-2. Boards Manager → install "esp32 by Espressif Systems"
-3. Open `esp32-cam-uploader.ino`, set `BOARD_TYPE` and `CAM_ID`
-4. Wire CP2102: 5V→5V, GND→GND, TXD→U0R, RXD→U0T, IO0→GND (flash mode)
-5. Board: AI Thinker ESP32-CAM (or Wrover Module for Freenove), Port: /dev/ttyUSB0
-6. Upload, press RST when "Connecting..." appears
-7. Remove IO0→GND, press RST to run
+## Credentials
 
-## WiFi Credentials (in firmware)
-- Home: `ludo` / `Vanillalotus849`
-- Phil's: `ATT8Fdp4tz` / `5u3kzu?g9=93`
+None are stored in this repo. `esp32/secrets.h` and `.env` are gitignored.
 
-## Server
-- Domain: raggsy.com
-- Stack: nginx, PHP 8.3, aaPanel
-- Dashboard: http://raggsy.com/cam/
-- Upload endpoint: http://raggsy.com/cam/upload.php?camId=cam1
+Commits up to and including `912c610` contain plaintext WiFi passwords, including
+a third party's home network. They are still in git history. **Rotate those
+passwords**; stripping them from the working tree does not revoke them. If the
+repo was ever pushed publicly, treat both networks as compromised.
+
+## Open work
+
+- TLS termination in front of nginx.
+- Per-camera detection log, rather than one shared list.
+- Buffer frames on the ESP32 when the server is unreachable.
+- Automated tests; there are currently none.

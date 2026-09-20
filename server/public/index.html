@@ -1,163 +1,832 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>ESP32-CAM Dashboard</title>
-  <style>
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { background: #111; color: #eee; font-family: system-ui, sans-serif; }
-    header { padding: 16px 24px; background: #1a1a1a; border-bottom: 1px solid #333; display: flex; justify-content: space-between; align-items: center; }
-    h1 { font-size: 1.2rem; font-weight: 600; }
-    #status { font-size: 0.8rem; color: #888; }
-    #grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(480px, 1fr)); gap: 12px; padding: 12px; }
-    .cam-card { background: #1a1a1a; border-radius: 8px; overflow: hidden; border: 1px solid #333; position: relative; }
-    .cam-card.motion { border-color: #f44; box-shadow: 0 0 12px rgba(255,68,68,0.3); }
-    .cam-header { padding: 8px 12px; display: flex; justify-content: space-between; align-items: center; background: #222; }
-    .cam-name { font-weight: 600; font-size: 0.9rem; }
-    .cam-age { font-size: 0.75rem; color: #888; }
-    .cam-age.stale { color: #f44; }
-    .motion-badge { display: none; font-size: 0.7rem; background: #f44; color: #fff; padding: 2px 8px; border-radius: 4px; margin-left: 8px; }
-    .motion-badge.active { display: inline; }
-    .cam-img { width: 100%; aspect-ratio: 4/3; object-fit: cover; display: block; background: #000; }
-    .empty { padding: 40px; text-align: center; color: #555; font-size: 0.9rem; }
-    .events-panel { padding: 12px; background: #1a1a1a; border-top: 1px solid #333; }
-    .events-title { font-size: 0.8rem; color: #888; margin-bottom: 8px; }
-    .event-thumbs { display: flex; gap: 4px; overflow-x: auto; padding-bottom: 4px; }
-    .event-thumb { width: 60px; height: 45px; object-fit: cover; border-radius: 3px; cursor: pointer; border: 1px solid #333; flex-shrink: 0; }
-    .event-thumb:hover { border-color: #f44; }
-    .event-time { font-size: 0.6rem; color: #666; text-align: center; }
-    .event-item { display: flex; flex-direction: column; align-items: center; gap: 2px; flex-shrink: 0; }
-    .modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.9); z-index: 100; justify-content: center; align-items: center; }
-    .modal.active { display: flex; }
-    .modal img { max-width: 90vw; max-height: 90vh; }
-    .modal-close { position: absolute; top: 20px; right: 30px; color: #fff; font-size: 2rem; cursor: pointer; }
-  </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ESP32-CAM | Management Console</title>
+<!--
+  Every panel in this dashboard reads real server state.
+
+  The previous version (demo_dashboard.html) was a mockup presented as a
+  product: the live view played a stock video from assets.mixkit.co, the
+  snapshot/record/reboot buttons called alert(), and the face-detection status
+  indicator picked its text with Math.random(). The Proton Drive panel
+  hardcoded "Healthy". Anything this page cannot verify now renders as
+  "unknown" rather than as good news.
+
+  It also built markup with innerHTML from server-supplied face names, which
+  was stored XSS. All untrusted text goes through textContent here.
+-->
+<style>
+  :root {
+    --bg: #0f172a; --panel: #1e293b; --line: #334155;
+    --accent: #3b82f6; --danger: #ef4444; --ok: #10b981; --warn: #fbbf24;
+    --text: #f8fafc; --dim: #94a3b8;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; height: 100vh; display: flex; overflow: hidden;
+    font-family: 'Segoe UI', system-ui, sans-serif;
+    background: var(--bg); color: var(--text);
+  }
+  nav {
+    width: 240px; flex-shrink: 0; background: var(--panel); padding: 20px;
+    border-right: 1px solid var(--line); display: flex; flex-direction: column; gap: 8px;
+  }
+  nav h1 { font-size: 1.1rem; margin: 0 0 24px; color: var(--accent); }
+  .nav-item {
+    padding: 12px 15px; border-radius: 8px; cursor: pointer;
+    color: var(--dim); font-weight: 500; transition: background .15s, color .15s;
+  }
+  .nav-item:hover { background: var(--line); color: var(--text); }
+  .nav-item.active { background: var(--accent); color: #fff; }
+  .nav-foot { margin-top: auto; font-size: .7rem; color: var(--dim); line-height: 1.6; }
+
+  main { flex: 1; padding: 20px; overflow-y: auto; }
+  .view { display: none; }
+  .view.active { display: block; }
+  h2 { margin: 0 0 16px; font-size: 1.1rem; font-weight: 600; }
+
+  .status-bar { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; }
+  .badge {
+    padding: 5px 12px; border-radius: 12px; font-size: .75rem; font-weight: 600;
+    background: var(--line); color: var(--dim);
+  }
+  .badge.ok { background: #065f46; color: #a7f3d0; }
+  .badge.bad { background: #7f1d1d; color: #fecaca; }
+  .badge.warn { background: #78350f; color: #fde68a; }
+
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 20px; }
+  .card h3 {
+    margin: 0 0 14px; font-size: .78rem; text-transform: uppercase;
+    letter-spacing: 1px; color: var(--dim);
+  }
+
+  #grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(420px, 1fr)); gap: 14px; }
+  .cam-card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+  .cam-card.motion { border-color: var(--danger); box-shadow: 0 0 12px rgba(239,68,68,.3); }
+  .cam-card.offline { opacity: .55; }
+  .cam-head { display: flex; justify-content: space-between; align-items: center; padding: 9px 12px; background: #222c3f; }
+  .cam-name { font-weight: 600; font-size: .9rem; }
+  .cam-age { font-size: .75rem; color: var(--dim); }
+  .cam-age.stale { color: var(--danger); }
+  .cam-img { display: block; width: 100%; aspect-ratio: 4/3; object-fit: cover; background: #000; }
+  .events { padding: 10px 12px; border-top: 1px solid var(--line); }
+  .events-title { font-size: .7rem; text-transform: uppercase; letter-spacing: .5px; color: var(--dim); margin-bottom: 7px; }
+  .thumbs { display: flex; gap: 5px; overflow-x: auto; }
+  .thumb-item { flex-shrink: 0; text-align: center; }
+  .thumb { width: 62px; height: 46px; object-fit: cover; border-radius: 3px; border: 1px solid var(--line); cursor: pointer; display: block; }
+  .thumb:hover { border-color: var(--danger); }
+  .thumb-time { font-size: .6rem; color: #64748b; }
+
+  .face-gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 15px; }
+  .face-card { background: var(--line); border-radius: 8px; padding: 10px; text-align: center; position: relative; }
+  .face-card img { width: 80px; height: 80px; border-radius: 50%; object-fit: cover; border: 2px solid var(--accent); }
+  .face-card .name { display: block; margin-top: 6px; font-size: .8rem; word-break: break-word; }
+  .face-card .del {
+    position: absolute; top: 5px; right: 5px; width: 20px; height: 20px;
+    border: none; border-radius: 50%; background: var(--danger); color: #fff;
+    font-size: 11px; cursor: pointer; line-height: 1;
+  }
+
+  .btn {
+    border: none; border-radius: 25px; padding: 10px 20px; cursor: pointer;
+    font-weight: 600; color: #fff; background: var(--accent);
+  }
+  .btn:disabled { opacity: .5; cursor: not-allowed; }
+  .btn.danger { background: var(--danger); }
+  .btn:active:not(:disabled) { transform: scale(.97); }
+
+  input[type=text], input[type=password], select {
+    padding: 9px; border-radius: 6px; border: 1px solid var(--line);
+    background: #0f172a; color: var(--text);
+  }
+  .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  .control { margin-bottom: 18px; }
+  .control-label { display: flex; justify-content: space-between; font-size: .85rem; margin-bottom: 6px; }
+  input[type=range] { width: 100%; }
+  .settings-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 18px; }
+
+  table { width: 100%; border-collapse: collapse; font-size: .85rem; }
+  th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--line); }
+  th { color: var(--dim); font-weight: 600; font-size: .72rem; text-transform: uppercase; }
+  .tag-unknown { color: #fca5a5; font-weight: 600; }
+  .tag-known { color: #a7f3d0; }
+
+  .empty { padding: 30px; text-align: center; color: #64748b; font-size: .9rem; }
+  .note { font-size: .78rem; color: var(--dim); line-height: 1.5; }
+
+  #toast {
+    position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
+    background: var(--panel); border: 1px solid var(--line); color: var(--text);
+    padding: 12px 22px; border-radius: 8px; display: none; z-index: 200; max-width: 80vw;
+  }
+  #modal {
+    position: fixed; inset: 0; background: rgba(0,0,0,.92); z-index: 150;
+    display: none; align-items: center; justify-content: center; cursor: zoom-out;
+  }
+  #modal.open { display: flex; }
+  #modal img { max-width: 92vw; max-height: 92vh; }
+
+  #login {
+    position: fixed; inset: 0; background: var(--bg); z-index: 300;
+    display: flex; align-items: center; justify-content: center;
+  }
+  #login .card { width: min(400px, 90vw); }
+</style>
 </head>
 <body>
-  <header>
-    <h1>ESP32-CAM Dashboard</h1>
-    <span id="status">polling...</span>
-  </header>
-  <div id="grid"></div>
-  <div class="modal" id="modal" onclick="this.classList.remove('active')">
-    <span class="modal-close">&times;</span>
-    <img id="modal-img" src="">
+
+<!-- ── Login gate ───────────────────────────────────────────────────────── -->
+<div id="login">
+  <div class="card">
+    <h3>Dashboard sign in</h3>
+    <p class="note">Enter the <code>ADMIN_TOKEN</code> from your server's <code>.env</code> file.</p>
+    <div class="row" style="margin-top:14px">
+      <input type="password" id="token-input" placeholder="Admin token" style="flex:1" autocomplete="current-password">
+      <button class="btn" id="login-btn">Sign in</button>
+    </div>
+    <p class="note" id="login-error" style="color:var(--danger); min-height:1.2em"></p>
   </div>
+</div>
 
-  <script>
-    const grid = document.getElementById('grid')
-    const statusEl = document.getElementById('status')
-    const cameras = new Map()
-    const motionState = new Map()
+<nav>
+  <h1>&#128247; CAM-CENTER</h1>
+  <div class="nav-item active" data-view="live">Live View</div>
+  <div class="nav-item" data-view="faces">Face Database</div>
+  <div class="nav-item" data-view="controls">Camera Controls</div>
+  <div class="nav-item" data-view="activity">Detections</div>
+  <div class="nav-item" data-view="sync">Cloud Sync</div>
+  <div class="nav-foot">
+    <span id="foot-brain">Brain: unknown</span><br>
+    <span id="foot-cams">Cameras: &mdash;</span><br>
+    <a href="#" id="logout" style="color:var(--dim)">Sign out</a>
+  </div>
+</nav>
 
-    function formatTime(ts) {
-      const d = new Date(ts * 1000)
-      return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+<main>
+  <div class="status-bar" id="status-bar"></div>
+
+  <!-- LIVE -->
+  <section id="view-live" class="view active">
+    <h2>Live View</h2>
+    <p class="note" style="margin-bottom:14px">
+      Latest uploaded frame per camera. Cameras send roughly 1 fps when idle and
+      5 fps while motion is active.
+    </p>
+    <div id="grid"><div class="empty">Loading&hellip;</div></div>
+  </section>
+
+  <!-- FACES -->
+  <section id="view-faces" class="view">
+    <h2>Face Recognition Database</h2>
+    <div class="card" style="margin-bottom:18px">
+      <h3>Add trusted person</h3>
+      <div class="row">
+        <input type="text" id="face-name" placeholder="Person's name" maxlength="64">
+        <input type="file" id="face-file" accept="image/jpeg">
+        <button class="btn" id="face-add">Add</button>
+      </div>
+      <p class="note" style="margin:12px 0 0">
+        JPEG only, up to 4&nbsp;MiB, one clearly visible face. The brain re-reads
+        this directory automatically; no restart needed.
+      </p>
+    </div>
+    <div class="card">
+      <h3>Known faces (<span id="face-count">0</span>)</h3>
+      <div id="face-gallery" class="face-gallery"></div>
+    </div>
+  </section>
+
+  <!-- CONTROLS -->
+  <section id="view-controls" class="view">
+    <h2>Camera Controls</h2>
+    <div class="row" style="margin-bottom:16px">
+      <label class="note" for="ctrl-cam">Camera</label>
+      <select id="ctrl-cam"></select>
+      <span class="note" id="ctrl-state"></span>
+    </div>
+    <div class="settings-grid">
+      <div class="card">
+        <h3>Image adjustment</h3>
+        <div class="control">
+          <div class="control-label"><span>Brightness</span><span id="v-brightness">0</span></div>
+          <input type="range" id="s-brightness" min="-2" max="2" step="1" value="0">
+        </div>
+        <div class="control">
+          <div class="control-label"><span>Contrast</span><span id="v-contrast">0</span></div>
+          <input type="range" id="s-contrast" min="-2" max="2" step="1" value="0">
+        </div>
+        <div class="control">
+          <div class="control-label"><span>Saturation</span><span id="v-saturation">0</span></div>
+          <input type="range" id="s-saturation" min="-2" max="2" step="1" value="0">
+        </div>
+        <div class="control">
+          <div class="control-label"><span>JPEG quality (lower = better)</span><span id="v-quality">12</span></div>
+          <input type="range" id="s-quality" min="10" max="63" step="1" value="12">
+        </div>
+      </div>
+      <div class="card">
+        <h3>Capture &amp; detection</h3>
+        <div class="control">
+          <div class="control-label"><span>Resolution</span><span id="v-framesize">SVGA</span></div>
+          <input type="range" id="s-framesize" min="5" max="13" step="1" value="8">
+        </div>
+        <div class="control">
+          <div class="control-label"><span>Motion sensitivity (% size change)</span><span id="v-motionPct">12</span></div>
+          <input type="range" id="s-motionPct" min="1" max="90" step="1" value="12">
+        </div>
+        <div class="control">
+          <div class="control-label"><span>Record only unknown faces</span><span id="v-recordUnknownOnly">on</span></div>
+          <input type="range" id="s-recordUnknownOnly" min="0" max="1" step="1" value="1">
+        </div>
+        <div class="control">
+          <div class="control-label"><span>Vertical flip</span><span id="v-vflip">on</span></div>
+          <input type="range" id="s-vflip" min="0" max="1" step="1" value="1">
+        </div>
+        <p class="note">
+          Motion detection compares compressed JPEG sizes, so it reacts to
+          lighting changes as well as movement. Face recognition on the server
+          is the accurate filter.
+        </p>
+      </div>
+      <div class="card">
+        <h3>Commands</h3>
+        <p class="note" style="margin-bottom:14px">
+          Queued for the selected camera and delivered on its next poll
+          (within ~2&nbsp;s). Commands expire after 2&nbsp;minutes if the camera
+          is offline.
+        </p>
+        <div class="row">
+          <button class="btn" id="cmd-record">Record burst</button>
+          <button class="btn" id="cmd-flash-on">Flash on</button>
+          <button class="btn" id="cmd-flash-off">Flash off</button>
+          <button class="btn danger" id="cmd-reboot">Reboot camera</button>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ACTIVITY -->
+  <section id="view-activity" class="view">
+    <h2>Face Detections</h2>
+    <div class="card">
+      <h3>Most recent (from the brain)</h3>
+      <div id="detections"><div class="empty">No detections recorded yet.</div></div>
+    </div>
+  </section>
+
+  <!-- SYNC -->
+  <section id="view-sync" class="view">
+    <h2>Cloud Sync</h2>
+    <div class="card" style="max-width:620px">
+      <h3>Proton Drive backup</h3>
+      <table>
+        <tbody>
+          <tr><th>Remote</th><td id="sync-remote">&mdash;</td></tr>
+          <tr><th>Last attempt</th><td id="sync-attempt">&mdash;</td></tr>
+          <tr><th>Last success</th><td id="sync-success">&mdash;</td></tr>
+          <tr><th>Result</th><td id="sync-message">&mdash;</td></tr>
+        </tbody>
+      </table>
+      <div class="row" style="margin-top:18px">
+        <button class="btn" id="sync-now">Trigger sync now</button>
+        <span class="note" id="sync-pending"></span>
+      </div>
+    </div>
+  </section>
+</main>
+
+<div id="modal"><img id="modal-img" alt="Motion frame"></div>
+<div id="toast"></div>
+
+<script>
+'use strict';
+
+// ── Helpers ─────────────────────────────────────────────────────────────────
+const $ = (id) => document.getElementById(id);
+
+// Custom header is the CSRF second factor; the server rejects cookie-based
+// mutations without it.
+const CSRF_HEADERS = { 'X-Requested-With': 'esp32cam-dashboard' };
+
+let unauthorised = false;
+
+async function api(url, options = {}) {
+  const res = await fetch(url, {
+    credentials: 'same-origin',
+    ...options,
+    headers: { ...CSRF_HEADERS, ...(options.headers || {}) },
+  });
+  if (res.status === 401) {
+    unauthorised = true;
+    showLogin();
+    throw new Error('Unauthorized');
+  }
+  let body = null;
+  try { body = await res.json(); } catch { /* non-JSON response */ }
+  if (!res.ok) {
+    throw new Error((body && body.error) || `HTTP ${res.status}`);
+  }
+  return body;
+}
+
+let toastTimer = null;
+function toast(message, isError = false) {
+  const el = $('toast');
+  el.textContent = message;
+  el.style.borderColor = isError ? 'var(--danger)' : 'var(--line)';
+  el.style.display = 'block';
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { el.style.display = 'none'; }, 3500);
+}
+
+const clockTime = (ms) =>
+  ms ? new Date(ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : '—';
+
+const stamp = (ms) => (ms ? new Date(ms).toLocaleString() : 'never');
+
+function ago(seconds) {
+  if (seconds === null || seconds === undefined) return 'unknown';
+  if (seconds < 2) return 'just now';
+  if (seconds < 60) return `${seconds}s ago`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
+  return `${Math.floor(seconds / 3600)}h ago`;
+}
+
+/** Build an element with untrusted text safely (never innerHTML). */
+function el(tag, className, text) {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (text !== undefined) node.textContent = text;
+  return node;
+}
+
+// ── Login ───────────────────────────────────────────────────────────────────
+function showLogin() {
+  $('login').style.display = 'flex';
+  stopPolling();
+}
+
+function hideLogin() {
+  $('login').style.display = 'none';
+  unauthorised = false;
+}
+
+async function attemptLogin() {
+  const token = $('token-input').value.trim();
+  if (!token) return;
+  $('login-btn').disabled = true;
+  $('login-error').textContent = '';
+  try {
+    await api('login.php', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token }),
+    });
+    $('token-input').value = '';
+    hideLogin();
+    startPolling();
+  } catch (err) {
+    // Surface the server's reason: a 500 here means ADMIN_TOKEN is unset in
+    // .env, which is a very different problem from a mistyped token.
+    $('login-error').textContent = err.message === 'Unauthorized' ? 'Invalid token.' : err.message;
+    unauthorised = false;
+    $('login').style.display = 'flex';
+  } finally {
+    $('login-btn').disabled = false;
+  }
+}
+
+$('login-btn').addEventListener('click', attemptLogin);
+$('token-input').addEventListener('keydown', (e) => { if (e.key === 'Enter') attemptLogin(); });
+$('logout').addEventListener('click', async (e) => {
+  e.preventDefault();
+  try { await api('login.php?action=logout', { method: 'POST' }); } catch { /* ignore */ }
+  showLogin();
+});
+
+// ── Navigation ──────────────────────────────────────────────────────────────
+let currentView = 'live';
+
+document.querySelectorAll('.nav-item').forEach((item) => {
+  item.addEventListener('click', () => {
+    document.querySelectorAll('.nav-item').forEach((n) => n.classList.remove('active'));
+    document.querySelectorAll('.view').forEach((v) => v.classList.remove('active'));
+    item.classList.add('active');
+    currentView = item.dataset.view;
+    $(`view-${currentView}`).classList.add('active');
+    if (currentView === 'faces') loadFaces();
+    if (currentView === 'controls') loadSettings();
+  });
+});
+
+// ── Live grid ───────────────────────────────────────────────────────────────
+// Nodes are created once and patched in place. The old dashboard rebuilt the
+// whole grid via innerHTML on every poll, which forced every <img> to reload
+// once a second and re-fired one events request per camera per render.
+const cards = new Map();
+let cameraIds = [];
+
+function cameraCard(id) {
+  const card = el('div', 'cam-card');
+  card.dataset.camId = id;
+
+  const head = el('div', 'cam-head');
+  const left = el('div');
+  left.append(el('span', 'cam-name', id));
+  const badge = el('span', 'badge', 'offline');
+  badge.style.marginLeft = '8px';
+  left.append(badge);
+  const age = el('span', 'cam-age', '—');
+  head.append(left, age);
+
+  const img = document.createElement('img');
+  img.className = 'cam-img';
+  img.alt = `Latest frame from ${id}`;
+  img.loading = 'lazy';
+
+  const events = el('div', 'events');
+  events.append(el('div', 'events-title', 'Motion events'));
+  const thumbs = el('div', 'thumbs');
+  events.append(thumbs);
+
+  card.append(head, img, events);
+  cards.set(id, { card, badge, age, img, thumbs, frameStamp: 0, eventsStamp: 0 });
+  return card;
+}
+
+function renderCameras(list) {
+  const grid = $('grid');
+  const ids = list.map((c) => c.id);
+
+  if (!list.length) {
+    grid.replaceChildren(el('div', 'empty',
+      'No cameras have reported yet. Flash a camera with a matching CAM_TOKEN and it will appear here.'));
+    cards.clear();
+    return;
+  }
+
+  // Drop cards for cameras that disappeared.
+  for (const [id, entry] of cards) {
+    if (!ids.includes(id)) { entry.card.remove(); cards.delete(id); }
+  }
+  if (grid.querySelector('.empty')) grid.replaceChildren();
+
+  for (const cam of list) {
+    let entry = cards.get(cam.id);
+    if (!entry) { grid.append(cameraCard(cam.id)); entry = cards.get(cam.id); }
+
+    entry.card.classList.toggle('motion', cam.motion);
+    entry.card.classList.toggle('offline', !cam.online);
+
+    entry.badge.textContent = cam.motion ? 'MOTION' : (cam.online ? 'online' : 'offline');
+    entry.badge.className = `badge ${cam.motion ? 'bad' : (cam.online ? 'ok' : '')}`;
+    entry.badge.style.marginLeft = '8px';
+
+    entry.age.textContent = ago(cam.ageSec);
+    entry.age.className = `cam-age${cam.ageSec > 15 ? ' stale' : ''}`;
+
+    // Only refetch the image when the frame actually changed.
+    if (cam.lastFrame && cam.lastFrame !== entry.frameStamp) {
+      entry.frameStamp = cam.lastFrame;
+      entry.img.src = `frame.php?camId=${encodeURIComponent(cam.id)}&t=${cam.lastFrame}`;
     }
 
-    async function loadEvents(camId) {
-      try {
-        const res = await fetch(`/events.php?camId=${camId}`)
-        const events = await res.json()
-        const panel = document.getElementById(`events-${camId}`)
-        if (!panel || !events.length) return
-        const recent = events.slice(-20).reverse()
-        panel.innerHTML = recent.map(e =>
-          `<div class="event-item">
-            <img class="event-thumb" src="/frame.php?camId=${camId}&event=${e.file}" onclick="showFull('${camId}','${e.file}')">
-            <span class="event-time">${formatTime(e.ts)}</span>
-          </div>`
-        ).join('')
-      } catch {}
+    // Events change only on motion; refresh at most every 5 seconds.
+    const now = Date.now();
+    if (cam.motion || now - entry.eventsStamp > 5000) {
+      entry.eventsStamp = now;
+      loadEvents(cam.id);
     }
+  }
 
-    function showFull(camId, file) {
-      document.getElementById('modal-img').src = `/frame.php?camId=${camId}&event=${file}`
-      document.getElementById('modal').classList.add('active')
+  if (ids.join() !== cameraIds.join()) {
+    cameraIds = ids;
+    populateCameraSelect();
+  }
+}
+
+async function loadEvents(camId) {
+  const entry = cards.get(camId);
+  if (!entry) return;
+  let data;
+  try { data = await api(`events.php?camId=${encodeURIComponent(camId)}&limit=20`); }
+  catch { return; }
+
+  const frag = document.createDocumentFragment();
+  for (const event of data.events) {
+    const item = el('div', 'thumb-item');
+    const img = document.createElement('img');
+    img.className = 'thumb';
+    img.loading = 'lazy';
+    img.alt = `Motion frame at ${clockTime(event.ts * 1000)}`;
+    img.src = `frame.php?camId=${encodeURIComponent(camId)}&event=${encodeURIComponent(event.file)}`;
+    img.addEventListener('click', () => openModal(img.src));
+    item.append(img, el('span', 'thumb-time', clockTime(event.ts * 1000)));
+    frag.append(item);
+  }
+  if (!data.events.length) frag.append(el('span', 'note', 'none yet'));
+  entry.thumbs.replaceChildren(frag);
+}
+
+function openModal(src) {
+  $('modal-img').src = src;
+  $('modal').classList.add('open');
+}
+$('modal').addEventListener('click', () => $('modal').classList.remove('open'));
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape') $('modal').classList.remove('open'); });
+
+// ── Status ──────────────────────────────────────────────────────────────────
+function renderStatus(status) {
+  const bar = $('status-bar');
+  const badges = [];
+
+  const brain = status.brain;
+  if (brain.heartbeatAge === null) {
+    badges.push(['Brain: no data', '']);
+  } else if (brain.running) {
+    badges.push([`Brain: running (${ago(brain.heartbeatAge)})`, 'ok']);
+  } else {
+    badges.push([`Brain: stalled (${ago(brain.heartbeatAge)})`, 'bad']);
+  }
+
+  if (!brain.faceRecognitionAvailable) {
+    badges.push(['Face recognition: UNAVAILABLE', 'bad']);
+  } else {
+    badges.push([`Known faces: ${brain.knownFaces}`, brain.knownFaces > 0 ? 'ok' : 'warn']);
+  }
+
+  badges.push([`Frames scanned: ${brain.framesScanned}`, '']);
+  if (brain.lastError) badges.push([`Brain error: ${brain.lastError}`, 'bad']);
+
+  const sync = status.sync;
+  if (!sync.lastAttempt) badges.push(['Backup: not run yet', 'warn']);
+  else badges.push([`Backup: ${sync.ok ? 'ok' : 'failing'} (${stamp(sync.lastAttempt * 1000)})`, sync.ok ? 'ok' : 'bad']);
+
+  bar.replaceChildren(...badges.map(([text, cls]) => el('span', `badge ${cls}`.trim(), text)));
+
+  $('foot-brain').textContent = brain.faceRecognitionAvailable
+    ? `Brain: ${brain.running ? 'running' : 'stalled'}`
+    : 'Brain: no recognition';
+
+  // Detections table
+  const host = $('detections');
+  if (!status.detections.length) {
+    host.replaceChildren(el('div', 'empty', 'No detections recorded yet.'));
+  } else {
+    const table = el('table');
+    const thead = el('thead');
+    const hrow = el('tr');
+    ['Time', 'Camera', 'Identity'].forEach((h) => hrow.append(el('th', null, h)));
+    thead.append(hrow);
+    const tbody = el('tbody');
+    for (const d of status.detections) {
+      const row = el('tr');
+      row.append(el('td', null, stamp(d.ts * 1000)));
+      row.append(el('td', null, d.camId));
+      row.append(el('td', d.known ? 'tag-known' : 'tag-unknown', d.known ? d.name : 'Unknown'));
+      tbody.append(row);
     }
+    table.append(thead, tbody);
+    host.replaceChildren(table);
+  }
 
-    function render() {
-      if (cameras.size === 0) {
-        grid.innerHTML = '<div class="empty">No cameras connected yet. Send images to /upload.php?camId=YOUR_CAM_ID</div>'
-        return
-      }
-      grid.innerHTML = ''
-      for (const [id, ts] of cameras) {
-        const motion = motionState.get(id) || false
-        const card = document.createElement('div')
-        card.className = `cam-card${motion ? ' motion' : ''}`
-        card.innerHTML = `
-          <div class="cam-header">
-            <div>
-              <span class="cam-name">${id}</span>
-              <span class="motion-badge${motion ? ' active' : ''}" id="badge-${id}">MOTION</span>
-            </div>
-            <span class="cam-age" id="age-${id}">just now</span>
-          </div>
-          <img class="cam-img" src="/frame.php?camId=${id}&t=${ts}" alt="${id}" id="img-${id}">
-          <div class="events-panel">
-            <div class="events-title">Motion events</div>
-            <div class="event-thumbs" id="events-${id}">loading...</div>
-          </div>
-        `
-        grid.appendChild(card)
-        loadEvents(id)
-      }
+  // Sync panel
+  $('sync-remote').textContent = sync.remote || 'not configured';
+  $('sync-attempt').textContent = stamp(sync.lastAttempt * 1000);
+  $('sync-success').textContent = stamp(sync.lastSuccess * 1000);
+  $('sync-message').textContent = sync.message || '—';
+  $('sync-message').style.color = sync.lastAttempt && !sync.ok ? 'var(--danger)' : 'var(--text)';
+  $('sync-pending').textContent = sync.pending ? 'Sync requested, waiting for the brain…' : '';
+  $('sync-now').disabled = sync.pending;
+}
+
+// ── Faces ───────────────────────────────────────────────────────────────────
+async function loadFaces() {
+  let data;
+  try { data = await api('manage_faces.php?action=list'); } catch { return; }
+
+  $('face-count').textContent = String(data.faces.length);
+  const gallery = $('face-gallery');
+
+  if (!data.faces.length) {
+    gallery.replaceChildren(el('div', 'empty', 'No known faces yet. Everyone will be reported as Unknown.'));
+    return;
+  }
+
+  const frag = document.createDocumentFragment();
+  for (const face of data.faces) {
+    const card = el('div', 'face-card');
+    const img = document.createElement('img');
+    img.alt = face.name;
+    img.src = `face.php?name=${encodeURIComponent(face.name)}`;
+    const del = el('button', 'del', '\u00d7');
+    del.title = `Remove ${face.name}`;
+    del.addEventListener('click', () => deleteFace(face.name));
+    // textContent, not innerHTML: names came from user input.
+    card.append(del, img, el('span', 'name', face.name));
+    frag.append(card);
+  }
+  gallery.replaceChildren(frag);
+}
+
+$('face-add').addEventListener('click', async () => {
+  const name = $('face-name').value.trim();
+  const file = $('face-file').files[0];
+  if (!name || !file) { toast('Enter a name and choose a JPEG.', true); return; }
+
+  const form = new FormData();
+  form.append('name', name);
+  form.append('image', file);
+
+  $('face-add').disabled = true;
+  try {
+    const result = await api('manage_faces.php?action=add', { method: 'POST', body: form });
+    toast(`Added ${result.name}.`);
+    $('face-name').value = '';
+    $('face-file').value = '';
+    loadFaces();
+  } catch (err) {
+    toast(err.message, true);
+  } finally {
+    $('face-add').disabled = false;
+  }
+});
+
+async function deleteFace(name) {
+  if (!confirm(`Remove ${name} from the trusted list?`)) return;
+  const form = new FormData();
+  form.append('name', name);
+  try {
+    await api('manage_faces.php?action=delete', { method: 'POST', body: form });
+    toast(`Removed ${name}.`);
+    loadFaces();
+  } catch (err) {
+    toast(err.message, true);
+  }
+}
+
+// ── Controls ────────────────────────────────────────────────────────────────
+const FRAMESIZE_NAMES = {
+  5: 'QVGA 320x240', 6: 'CIF 400x296', 7: 'VGA 640x480', 8: 'SVGA 800x600',
+  9: 'XGA 1024x768', 10: 'HD 1280x720', 11: 'SXGA 1280x1024', 12: 'UXGA 1600x1200', 13: 'UXGA+',
+};
+const SETTING_KEYS = ['brightness', 'contrast', 'saturation', 'quality', 'framesize', 'motionPct', 'recordUnknownOnly', 'vflip'];
+
+function labelFor(key, value) {
+  if (key === 'framesize') return FRAMESIZE_NAMES[value] || String(value);
+  if (key === 'recordUnknownOnly' || key === 'vflip') return value === 1 ? 'on' : 'off';
+  return String(value);
+}
+
+function populateCameraSelect() {
+  const select = $('ctrl-cam');
+  const previous = select.value;
+  select.replaceChildren(...cameraIds.map((id) => {
+    const option = document.createElement('option');
+    option.value = id;
+    option.textContent = id;
+    return option;
+  }));
+  if (cameraIds.includes(previous)) select.value = previous;
+  const disabled = cameraIds.length === 0;
+  ['cmd-record', 'cmd-reboot', 'cmd-flash-on', 'cmd-flash-off'].forEach((id) => { $(id).disabled = disabled; });
+  $('ctrl-state').textContent = disabled ? 'No cameras available.' : '';
+  if (!disabled && currentView === 'controls') loadSettings();
+}
+
+let settingsLoading = false;
+
+async function loadSettings() {
+  const camId = $('ctrl-cam').value;
+  if (!camId) return;
+  settingsLoading = true;
+  try {
+    const data = await api(`settings.php?camId=${encodeURIComponent(camId)}`);
+    for (const key of SETTING_KEYS) {
+      const value = Number(data.settings[key]);
+      if (Number.isNaN(value)) continue;
+      $(`s-${key}`).value = String(value);
+      $(`v-${key}`).textContent = labelFor(key, value);
     }
+    $('ctrl-state').textContent = '';
+  } catch (err) {
+    $('ctrl-state').textContent = err.message;
+  } finally {
+    settingsLoading = false;
+  }
+}
 
-    function updateAges() {
-      const now = Date.now()
-      for (const [id, ts] of cameras) {
-        const ageEl = document.getElementById(`age-${id}`)
-        if (!ageEl) continue
-        const sec = Math.round((now - ts) / 1000)
-        ageEl.textContent = sec < 2 ? 'just now' : `${sec}s ago`
-        ageEl.className = `cam-age${sec > 10 ? ' stale' : ''}`
-      }
-    }
+let saveTimer = null;
 
-    async function poll() {
-      try {
-        const res = await fetch('/cameras.php')
-        const list = await res.json()
-        let changed = false
-        const seen = new Set()
+function scheduleSave() {
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(saveSettings, 400);   // debounce slider drags
+}
 
-        for (const c of list) {
-          seen.add(c.id)
-          const old = cameras.get(c.id)
-          if (!old || old !== c.lastFrame) {
-            changed = true
-            cameras.set(c.id, c.lastFrame)
-            const img = document.getElementById(`img-${c.id}`)
-            if (img) img.src = `/frame.php?camId=${c.id}&t=${c.lastFrame}`
-          }
-          if (c.motion !== undefined) {
-            const was = motionState.get(c.id)
-            if (was !== c.motion) {
-              motionState.set(c.id, c.motion)
-              changed = true
-            }
-          }
-        }
+async function saveSettings() {
+  const camId = $('ctrl-cam').value;
+  if (!camId) return;
+  const payload = {};
+  for (const key of SETTING_KEYS) payload[key] = Number($(`s-${key}`).value);
+  try {
+    await api(`settings.php?camId=${encodeURIComponent(camId)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    $('ctrl-state').textContent = 'Saved. The camera applies this within 30s.';
+  } catch (err) {
+    $('ctrl-state').textContent = err.message;
+  }
+}
 
-        for (const id of cameras.keys()) {
-          if (!seen.has(id)) { cameras.delete(id); changed = true }
-        }
+SETTING_KEYS.forEach((key) => {
+  $(`s-${key}`).addEventListener('input', (e) => {
+    $(`v-${key}`).textContent = labelFor(key, Number(e.target.value));
+    if (!settingsLoading) scheduleSave();
+  });
+});
 
-        if (changed) render()
-        statusEl.textContent = 'live'
-      } catch {
-        statusEl.textContent = 'poll failed'
-      }
-    }
+$('ctrl-cam').addEventListener('change', loadSettings);
 
-    poll().then(() => {
-      render()
-      setInterval(poll, 1000)
-      setInterval(updateAges, 1000)
-    })
-  </script>
+async function sendCommand(action, confirmText) {
+  const camId = $('ctrl-cam').value;
+  if (!camId) return;
+  if (confirmText && !confirm(confirmText)) return;
+  try {
+    await api(`commands.php?camId=${encodeURIComponent(camId)}&action=${action}`, { method: 'POST' });
+    toast(`${action} queued for ${camId}. It will run on the next poll.`);
+  } catch (err) {
+    toast(err.message, true);
+  }
+}
+
+$('cmd-record').addEventListener('click', () => sendCommand('RECORD_VIDEO'));
+$('cmd-flash-on').addEventListener('click', () => sendCommand('FLASH_ON'));
+$('cmd-flash-off').addEventListener('click', () => sendCommand('FLASH_OFF'));
+$('cmd-reboot').addEventListener('click', () => sendCommand('REBOOT', 'Reboot this camera now?'));
+
+// ── Sync ────────────────────────────────────────────────────────────────────
+$('sync-now').addEventListener('click', async () => {
+  $('sync-now').disabled = true;
+  try {
+    await api('status.php?action=sync', { method: 'POST' });
+    toast('Sync requested. The brain will start within a few seconds.');
+  } catch (err) {
+    toast(err.message, true);
+    $('sync-now').disabled = false;
+  }
+});
+
+// ── Polling ─────────────────────────────────────────────────────────────────
+let cameraTimer = null;
+let statusTimer = null;
+
+async function pollCameras() {
+  try {
+    const data = await api('cameras.php');
+    renderCameras(data.cameras);
+    $('foot-cams').textContent = `Cameras: ${data.cameras.filter((c) => c.online).length}/${data.cameras.length} online`;
+  } catch { /* handled in api() */ }
+}
+
+async function pollStatus() {
+  try { renderStatus(await api('status.php')); }
+  catch { /* handled in api() */ }
+}
+
+function startPolling() {
+  stopPolling();
+  pollCameras();
+  pollStatus();
+  loadFaces();
+  cameraTimer = setInterval(pollCameras, 1000);
+  statusTimer = setInterval(pollStatus, 5000);
+}
+
+function stopPolling() {
+  clearInterval(cameraTimer);
+  clearInterval(statusTimer);
+  cameraTimer = statusTimer = null;
+}
+
+// Pause polling when the tab is hidden; three cameras at 1 Hz is enough traffic.
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) stopPolling();
+  else if (!unauthorised) startPolling();
+});
+
+(async function boot() {
+  try {
+    const session = await api('login.php');
+    if (session.authenticated) { hideLogin(); startPolling(); }
+    else showLogin();
+  } catch {
+    showLogin();
+  }
+})();
+</script>
 </body>
 </html>
