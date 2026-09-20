@@ -1,27 +1,44 @@
 <?php
-$camId = $_GET['camId'] ?? null;
-if (!$camId || !preg_match('/^[a-zA-Z0-9_-]+$/', $camId)) {
-    http_response_code(400);
-    header('Content-Type: application/json');
-    echo json_encode(['error' => 'Invalid camId']);
-    exit;
-}
+/**
+ * Serves the latest frame for a camera, or one archived motion frame.
+ */
 
-$event = $_GET['event'] ?? null;
-if ($event && preg_match('/^[0-9]+\.jpg$/', $event)) {
-    $file = __DIR__ . '/../uploads/' . $camId . '/' . $event;
+declare(strict_types=1);
+
+require_once __DIR__ . '/lib/common.php';
+
+send_base_headers();
+require_admin_auth();
+
+$camId   = require_cam_id();
+$uploads = uploads_dir();
+
+$requested = (string) ($_GET['event'] ?? '');
+if ($requested !== '') {
+    $event = clean_event_name($requested);
+    if ($event === null) {
+        fail(400, 'Invalid event');
+    }
+    $dir  = $uploads . '/' . $camId;
+    $path = $dir . '/' . $event;
 } else {
-    $file = __DIR__ . '/../uploads/' . $camId . '.jpg';
+    $dir  = $uploads;
+    $path = $uploads . '/' . $camId . '.jpg';
 }
 
-if (!file_exists($file)) {
-    http_response_code(404);
-    header('Content-Type: application/json');
-    echo json_encode(['error' => 'No frame yet']);
-    exit;
+if (!is_file($path)) {
+    fail(404, 'No frame yet');
 }
+
+$real = assert_within($dir, $path);
+$size = filesize($real);
 
 header('Content-Type: image/jpeg');
-header('Cache-Control: no-cache, no-store, must-revalidate');
-header('Content-Length: ' . filesize($file));
-readfile($file);
+header('Content-Length: ' . $size);
+// Archived frames are immutable; the live frame must never be cached.
+if ($requested !== '') {
+    header('Cache-Control: private, max-age=3600, immutable');
+} else {
+    header('Cache-Control: no-cache, no-store, must-revalidate');
+}
+readfile($real);

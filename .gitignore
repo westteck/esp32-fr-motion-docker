@@ -5,7 +5,9 @@ rclone-config/
 
 # Credentials & Secrets
 *.conf
+!nginx.conf
 .env
+esp32/secrets.h
 proton-drive-rclone-setup.md
 
 # IDE / OS

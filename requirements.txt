@@ -1,0 +1,9 @@
+# Pinned so that a rebuild produces the same image.
+# Note: opencv was imported by the old brain_script.py but never used; dropping
+# it removes ~60 MB and a long build.
+face-recognition==1.3.0
+face-recognition-models==0.3.0
+dlib==19.24.6
+# face_recognition/dlib are not NumPy 2.x clean; stay on the 1.x series.
+numpy==1.26.4
+Pillow==10.4.0
